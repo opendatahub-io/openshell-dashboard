@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"strings"
 	"testing"
 
 	openshell "github.com/NVIDIA/OpenShell/sdk/go/openshell/v1"
@@ -45,17 +47,582 @@ func TestGetGateway(t *testing.T) {
 	}
 }
 
+// GET /gateway carries the extensions the gateway negotiated, which is what
+// `openshell gateway info` lists under "Extensions". A gateway that reports
+// none still answers with an array.
+func TestGetGatewayExtensions(t *testing.T) {
+	tests := []struct {
+		name       string
+		extensions []openshell.ExtensionInfo
+		want       []any
+	}{
+		{
+			name: "negotiated extensions",
+			extensions: []openshell.ExtensionInfo{
+				{
+					Kind:                  openshell.ExtensionKindComputeDriver,
+					ConfiguredName:        "podman",
+					ImplementationName:    "example-driver",
+					ImplementationVersion: "0.1.2",
+					ProtocolMajor:         1,
+					ProtocolMinor:         2,
+					SupportedCapabilities: []string{"capability-a"},
+					RequiredCapabilities:  []string{"gateway-capability"},
+				},
+				{Kind: openshell.ExtensionKindGatewayInterceptor, ConfiguredName: "audit"},
+			},
+			want: []any{
+				map[string]any{
+					"kind":                  "COMPUTE_DRIVER",
+					"configuredName":        "podman",
+					"implementationName":    "example-driver",
+					"implementationVersion": "0.1.2",
+					"protocolMajor":         float64(1),
+					"protocolMinor":         float64(2),
+					"supportedCapabilities": []any{"capability-a"},
+					"requiredCapabilities":  []any{"gateway-capability"},
+				},
+				map[string]any{
+					"kind":           "GATEWAY_INTERCEPTOR",
+					"configuredName": "audit",
+					"protocolMajor":  float64(0),
+					"protocolMinor":  float64(0),
+				},
+			},
+		},
+		{name: "none", want: []any{}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sdk := &mockSDK{}
+			sdk.health.getGatewayInfoFn = func(_ context.Context) (*openshell.GatewayInfo, error) {
+				return &openshell.GatewayInfo{Status: openshell.ServiceStatusHealthy, Version: "0.1.2", Extensions: tc.extensions}, nil
+			}
+			handler := NewGatewayHandler(services.NewGatewayService(sdk), auth.New(auth.Config{}), models.AuthConfigResponse{})
+			w := httptest.NewRecorder()
+			handler.GetGateway(w, httptest.NewRequest(http.MethodGet, "/gateway", nil))
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d; body: %s", w.Code, w.Body.String())
+			}
+			var body map[string]any
+			if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			got, isArray := body["extensions"].([]any)
+			if !isArray {
+				t.Fatalf("extensions = %v, want a JSON array", body["extensions"])
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("extensions = %v\nwant %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// GET /auth/whoami carries what `openshell whoami` prints: the subject, the
+// name, the provider that validated the identity, the roles and the scopes.
+func TestGetWhoAmIIdentity(t *testing.T) {
+	sdk := &mockSDK{}
+	sdk.health.getCurrentUserFn = func(_ context.Context) (*openshell.CurrentUser, error) {
+		return &openshell.CurrentUser{
+			Subject:          "f3b1c2",
+			DisplayName:      "Ada",
+			Roles:            []string{"openshell-admin"},
+			Scopes:           []string{"openid", "sandbox:read"},
+			IdentityProvider: "oidc",
+		}, nil
+	}
+	handler := NewGatewayHandler(services.NewGatewayService(sdk), auth.New(auth.Config{}), models.AuthConfigResponse{})
+	w := httptest.NewRecorder()
+	handler.GetWhoAmI(w, httptest.NewRequest(http.MethodGet, "/auth/whoami", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; body: %s", w.Code, w.Body.String())
+	}
+	const want = `{"subject":"f3b1c2","displayName":"Ada","identityProvider":"oidc","roles":["openshell-admin"],"scopes":["openid","sandbox:read"]}`
+	if got := strings.TrimSpace(w.Body.String()); got != want {
+		t.Errorf("body = %s\nwant %s", got, want)
+	}
+}
+
+// GET /gateway carries the dashboard's verdict on the gateway's version. The
+// three gateways here are the ones that matter today: the release the 0.x
+// line serves, the newest release this line is tested against, and upstream
+// HEAD. Each body is logged, so `go test -v -run TestGetGatewayCompatibility`
+// shows exactly what the frontend receives.
+func TestGetGatewayCompatibility(t *testing.T) {
+	tests := []struct { //nolint:govet // fieldalignment: test readability
+		name       string
+		minVersion string
+		maxVersion string
+		reported   string
+		want       map[string]any
+	}{
+		{
+			name:       "gateway older than the range",
+			minVersion: "0.1.0", maxVersion: "0.1.2",
+			reported: "0.0.116",
+			want:     map[string]any{"status": "unsupported", "supportedMin": "0.1.0", "supportedMax": "0.1.2"},
+		},
+		{
+			name:       "gateway inside the range",
+			minVersion: "0.1.0", maxVersion: "0.1.2",
+			reported: "0.1.2",
+			want:     map[string]any{"status": "supported", "supportedMin": "0.1.0", "supportedMax": "0.1.2"},
+		},
+		{
+			name:       "gateway newer than the range",
+			minVersion: "0.1.0", maxVersion: "0.1.2",
+			reported: "0.1.3-dev.84+ge7fdd6bee",
+			want:     map[string]any{"status": "untested", "supportedMin": "0.1.0", "supportedMax": "0.1.2"},
+		},
+		{
+			name:       "gateway version unreadable",
+			minVersion: "0.1.0", maxVersion: "0.1.2",
+			reported: "",
+			want:     map[string]any{"status": "unknown", "supportedMin": "0.1.0", "supportedMax": "0.1.2"},
+		},
+		{
+			// No range configured: the BFF does not guess one, even for a
+			// gateway it would otherwise call unsupported.
+			name:     "no range configured",
+			reported: "0.0.116",
+			want:     map[string]any{"status": "unknown"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sdk := &mockSDK{}
+			sdk.health.getGatewayInfoFn = func(_ context.Context) (*openshell.GatewayInfo, error) {
+				return &openshell.GatewayInfo{
+					Status:         openshell.ServiceStatusHealthy,
+					Version:        tc.reported,
+					ComputeDrivers: []openshell.ComputeDriverInfo{{Name: "podman"}},
+				}, nil
+			}
+			support, err := models.ParseGatewaySupport(tc.minVersion, tc.maxVersion)
+			if err != nil {
+				t.Fatalf("ParseGatewaySupport: %v", err)
+			}
+			handler := NewGatewayHandler(services.NewGatewayService(sdk), auth.New(auth.Config{}), models.AuthConfigResponse{})
+			handler.SetGatewaySupport(support)
+
+			w := httptest.NewRecorder()
+			handler.GetGateway(w, httptest.NewRequest(http.MethodGet, "/gateway", nil))
+
+			// Informational only: an out-of-range gateway is still a 200.
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+			}
+			t.Logf("gateway %q, range %q -> %s", tc.reported, support.String(), w.Body.String())
+
+			var body map[string]any
+			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			// The gateway's own fields are passed through untouched.
+			if body["status"] != "HEALTHY" || body["gatewayVersion"] != tc.reported {
+				t.Errorf("gateway fields changed: %v", body)
+			}
+			got, ok := body["compatibility"].(map[string]any)
+			if !ok {
+				t.Fatalf("compatibility is missing or not an object: %v", body)
+			}
+			if len(got) != len(tc.want) {
+				t.Errorf("compatibility = %v, want %v", got, tc.want)
+			}
+			for key, want := range tc.want {
+				if got[key] != want {
+					t.Errorf("compatibility.%s = %v, want %v", key, got[key], want)
+				}
+			}
+		})
+	}
+}
+
+// A gateway that cannot be reached has no version to judge, so the error is
+// relayed as before rather than dressed up as a compatibility result.
 func TestGetGatewayUnavailable(t *testing.T) {
 	sdk := &mockSDK{}
 	sdk.health.getGatewayInfoFn = func(_ context.Context) (*openshell.GatewayInfo, error) {
 		return nil, &openshell.StatusError{Code: openshell.ErrorUnavailable, Message: "down"}
 	}
 	handler := NewGatewayHandler(services.NewGatewayService(sdk), auth.New(auth.Config{}), models.AuthConfigResponse{})
+	support, err := models.ParseGatewaySupport("0.1.0", "0.1.2")
+	if err != nil {
+		t.Fatalf("ParseGatewaySupport: %v", err)
+	}
+	handler.SetGatewaySupport(support)
 	req := httptest.NewRequest(http.MethodGet, "/gateway", nil)
 	w := httptest.NewRecorder()
 	handler.GetGateway(w, req)
 	if w.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502", w.Code)
+	}
+}
+
+// The gateway refuses GetGatewayInfo to anyone who is not a platform admin
+// ("role 'openshell-admin' required"), yet a gateway that is too old breaks
+// that user's pages just the same. The verdict therefore has a route of its
+// own that reads the version from the health check, which needs no role.
+func TestGetGatewayCompatibilityNeedsNoAdminRole(t *testing.T) {
+	sdk := &mockSDK{}
+	gatewayInfoCalls := 0
+	sdk.health.getGatewayInfoFn = func(_ context.Context) (*openshell.GatewayInfo, error) {
+		gatewayInfoCalls++
+		return nil, &openshell.StatusError{Code: openshell.ErrorPermissionDenied, Message: "role 'openshell-admin' required"}
+	}
+	sdk.health.checkFn = func(_ context.Context) (*openshell.HealthResult, error) {
+		return &openshell.HealthResult{Healthy: true, Version: "0.0.116"}, nil
+	}
+	handler := NewGatewayHandler(services.NewGatewayService(sdk), auth.New(auth.Config{}), models.AuthConfigResponse{})
+	support, err := models.ParseGatewaySupport("0.1.0", "0.1.2")
+	if err != nil {
+		t.Fatalf("ParseGatewaySupport: %v", err)
+	}
+	handler.SetGatewaySupport(support)
+
+	// The admin-only route stays refused: the BFF relays the gateway's answer
+	// and does not paper over it.
+	refused := httptest.NewRecorder()
+	handler.GetGateway(refused, httptest.NewRequest(http.MethodGet, "/gateway", nil))
+	if refused.Code != http.StatusForbidden {
+		t.Fatalf("GET /gateway = %d, want 403; body: %s", refused.Code, refused.Body.String())
+	}
+
+	// The verdict is not refused.
+	w := httptest.NewRecorder()
+	handler.GetGatewayCompatibility(w, httptest.NewRequest(http.MethodGet, "/gateway/compatibility", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /gateway/compatibility = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	t.Logf("GetGatewayInfo refused -> %s", w.Body.String())
+	const want = `{"gatewayVersion":"0.0.116","healthy":true,"compatibility":{"status":"unsupported","supportedMin":"0.1.0","supportedMax":"0.1.2"}}`
+	if got := strings.TrimSpace(w.Body.String()); got != want {
+		t.Errorf("body = %s, want %s", got, want)
+	}
+	// And it never touched the call that would have refused it.
+	if gatewayInfoCalls != 1 {
+		t.Errorf("GetGatewayInfo was called %d times, want 1 (by GET /gateway only)", gatewayInfoCalls)
+	}
+}
+
+// GET /gateway/compatibility judges the version the health check reports the
+// same way GET /gateway judges the one GetGatewayInfo reports. Each body is
+// logged, so `go test -v -run TestGetGatewayCompatibilityRoute` shows exactly
+// what the notice in the UI receives.
+func TestGetGatewayCompatibilityRoute(t *testing.T) {
+	tests := []struct { //nolint:govet // fieldalignment: test readability
+		name       string
+		minVersion string
+		maxVersion string
+		reported   string
+		want       string
+	}{
+		{
+			name:       "gateway older than the range",
+			minVersion: "0.1.0", maxVersion: "0.1.2",
+			reported: "0.0.116",
+			want:     `{"gatewayVersion":"0.0.116","healthy":true,"compatibility":{"status":"unsupported","supportedMin":"0.1.0","supportedMax":"0.1.2"}}`,
+		},
+		{
+			name:       "gateway inside the range",
+			minVersion: "0.1.0", maxVersion: "0.1.2",
+			reported: "0.1.2",
+			want:     `{"gatewayVersion":"0.1.2","healthy":true,"compatibility":{"status":"supported","supportedMin":"0.1.0","supportedMax":"0.1.2"}}`,
+		},
+		{
+			name:       "gateway newer than the range",
+			minVersion: "0.1.0", maxVersion: "0.1.2",
+			reported: "0.1.3-dev.84+ge7fdd6bee",
+			want:     `{"gatewayVersion":"0.1.3-dev.84+ge7fdd6bee","healthy":true,"compatibility":{"status":"untested","supportedMin":"0.1.0","supportedMax":"0.1.2"}}`,
+		},
+		{
+			// The version is passed through as reported; only the verdict
+			// reads it as the release it rebuilds.
+			name:       "downstream rebuild of the minimum",
+			minVersion: "0.1.2", maxVersion: "0.1.2",
+			reported: "0.1.2-rhaiv.5",
+			want:     `{"gatewayVersion":"0.1.2-rhaiv.5","healthy":true,"compatibility":{"status":"supported","supportedMin":"0.1.2","supportedMax":"0.1.2"}}`,
+		},
+		{
+			name:       "gateway that does not know its own version",
+			minVersion: "0.1.0", maxVersion: "0.1.2",
+			reported: "0.0.0",
+			want:     `{"gatewayVersion":"0.0.0","healthy":true,"compatibility":{"status":"unknown","supportedMin":"0.1.0","supportedMax":"0.1.2"}}`,
+		},
+		{
+			name:       "gateway version empty",
+			minVersion: "0.1.0", maxVersion: "0.1.2",
+			reported: "",
+			want:     `{"gatewayVersion":"","healthy":true,"compatibility":{"status":"unknown","supportedMin":"0.1.0","supportedMax":"0.1.2"}}`,
+		},
+		{
+			name:     "no range configured",
+			reported: "0.0.116",
+			want:     `{"gatewayVersion":"0.0.116","healthy":true,"compatibility":{"status":"unknown"}}`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sdk := &mockSDK{}
+			sdk.health.checkFn = func(_ context.Context) (*openshell.HealthResult, error) {
+				return &openshell.HealthResult{Healthy: true, Version: tc.reported}, nil
+			}
+			support, err := models.ParseGatewaySupport(tc.minVersion, tc.maxVersion)
+			if err != nil {
+				t.Fatalf("ParseGatewaySupport: %v", err)
+			}
+			handler := NewGatewayHandler(services.NewGatewayService(sdk), auth.New(auth.Config{}), models.AuthConfigResponse{})
+			handler.SetGatewaySupport(support)
+
+			w := httptest.NewRecorder()
+			handler.GetGatewayCompatibility(w, httptest.NewRequest(http.MethodGet, "/gateway/compatibility", nil))
+
+			// Informational only: an out-of-range gateway is still a 200.
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+			}
+			t.Logf("gateway %q, range %q -> %s", tc.reported, support.String(), w.Body.String())
+			if got := strings.TrimSpace(w.Body.String()); got != tc.want {
+				t.Errorf("body = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// With the gateway down there is no version to judge. The error is relayed
+// with the same status as on every other route, not turned into "unknown".
+func TestGetGatewayCompatibilityUnavailable(t *testing.T) {
+	sdk := &mockSDK{}
+	sdk.health.checkFn = func(_ context.Context) (*openshell.HealthResult, error) {
+		return nil, &openshell.StatusError{Code: openshell.ErrorUnavailable, Message: "down"}
+	}
+	handler := NewGatewayHandler(services.NewGatewayService(sdk), auth.New(auth.Config{}), models.AuthConfigResponse{})
+	support, err := models.ParseGatewaySupport("0.1.0", "0.1.2")
+	if err != nil {
+		t.Fatalf("ParseGatewaySupport: %v", err)
+	}
+	handler.SetGatewaySupport(support)
+
+	w := httptest.NewRecorder()
+	handler.GetGatewayCompatibility(w, httptest.NewRequest(http.MethodGet, "/gateway/compatibility", nil))
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body: %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "compatibility") {
+		t.Errorf("an unreachable gateway was given a verdict: %s", w.Body.String())
+	}
+	// Nor is it called unhealthy: it said nothing about its health.
+	if strings.Contains(w.Body.String(), "healthy") {
+		t.Errorf("an unreachable gateway was given a health: %s", w.Body.String())
+	}
+}
+
+// GET /gateway/compatibility carries what the gateway's health check says
+// about the gateway, so that a user who is not a platform admin — and cannot
+// read GET /gateway — still learns it. The answer is the health check's own:
+// healthy, or answered and not healthy. A gateway that did not answer is an
+// error, and a source that reports no health leaves the field out.
+func TestGetGatewayCompatibilityHealth(t *testing.T) {
+	unavailable := &openshell.StatusError{Code: openshell.ErrorUnavailable, Message: "down"}
+	tests := []struct { //nolint:govet // fieldalignment: test readability
+		name       string
+		result     *openshell.HealthResult
+		err        error
+		wantStatus int
+		// wantHealthy is the JSON value of "healthy", or "" for a body
+		// that must not have the key.
+		wantHealthy string
+		wantVersion string
+	}{
+		{
+			name:       "healthy",
+			result:     &openshell.HealthResult{Healthy: true, Version: "0.1.2"},
+			wantStatus: http.StatusOK, wantHealthy: "true", wantVersion: "0.1.2",
+		},
+		{
+			// Degraded, unhealthy or unspecified: the SDK does not say which.
+			// It is still an answer, so it is reported and not left out.
+			name:       "answered, and not with healthy",
+			result:     &openshell.HealthResult{Healthy: false, Version: "0.1.2"},
+			wantStatus: http.StatusOK, wantHealthy: "false", wantVersion: "0.1.2",
+		},
+		{
+			name:       "the SDK answered with nothing",
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "gateway unreachable",
+			err:        unavailable,
+			wantStatus: http.StatusBadGateway,
+		},
+		{
+			name:       "health check timed out",
+			err:        &openshell.StatusError{Code: openshell.ErrorDeadlineExceeded, Message: "deadline exceeded"},
+			wantStatus: http.StatusBadGateway,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sdk := &mockSDK{}
+			checks := 0
+			sdk.health.checkFn = func(_ context.Context) (*openshell.HealthResult, error) {
+				checks++
+				return tc.result, tc.err
+			}
+			sdk.health.getGatewayInfoFn = func(_ context.Context) (*openshell.GatewayInfo, error) {
+				t.Error("the admin-only GetGatewayInfo was called for the health")
+				return nil, unavailable
+			}
+			handler := NewGatewayHandler(services.NewGatewayService(sdk), auth.New(auth.Config{}), models.AuthConfigResponse{})
+
+			w := httptest.NewRecorder()
+			handler.GetGatewayCompatibility(w, httptest.NewRequest(http.MethodGet, "/gateway/compatibility", nil))
+			if w.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; body: %s", w.Code, tc.wantStatus, w.Body.String())
+			}
+			// One health check answers the version and the health together.
+			if checks != 1 {
+				t.Errorf("the health check was called %d times, want 1", checks)
+			}
+			var body map[string]json.RawMessage
+			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode: %v; body: %s", err, w.Body.String())
+			}
+			if got := string(body["healthy"]); got != tc.wantHealthy {
+				t.Errorf("healthy = %q, want %q; body: %s", got, tc.wantHealthy, w.Body.String())
+			}
+			if tc.wantStatus != http.StatusOK {
+				if string(body["code"]) != `"gateway_unavailable"` {
+					t.Errorf("code = %s, want gateway_unavailable", body["code"])
+				}
+				return
+			}
+			if got := string(body["gatewayVersion"]); got != `"`+tc.wantVersion+`"` {
+				t.Errorf("gatewayVersion = %s, want %q", got, tc.wantVersion)
+			}
+		})
+	}
+}
+
+// versionOnlyGatewayService is a downstream gateway service that offers the
+// role-free version source and was written before the health had one: it has
+// GetGatewayVersion and no GetGatewayHealth.
+type versionOnlyGatewayService struct {
+	infoOnlyGatewayService
+	version string
+}
+
+func (s versionOnlyGatewayService) GetGatewayVersion(context.Context) (string, error) {
+	return s.version, nil
+}
+
+// A downstream service keeps compiling and keeps its verdict whichever of the
+// optional sources it has. The health comes from the best source on offer,
+// and is left out when there is none rather than guessed.
+func TestGetGatewayCompatibilityHealthSources(t *testing.T) {
+	tests := []struct { //nolint:govet // fieldalignment: test readability
+		name string
+		svc  services.GatewayServiceInterface
+		want string
+	}{
+		{
+			name: "version reader only: no health to report",
+			svc:  versionOnlyGatewayService{version: "0.1.2"},
+			want: `{"gatewayVersion":"0.1.2","compatibility":{"status":"unknown"}}`,
+		},
+		{
+			name: "gateway info only, healthy",
+			svc:  infoOnlyGatewayService{info: &models.GatewayInfo{Status: "HEALTHY", GatewayVersion: "0.1.2"}},
+			want: `{"gatewayVersion":"0.1.2","healthy":true,"compatibility":{"status":"unknown"}}`,
+		},
+		{
+			name: "gateway info only, degraded",
+			svc:  infoOnlyGatewayService{info: &models.GatewayInfo{Status: "DEGRADED", GatewayVersion: "0.1.2"}},
+			want: `{"gatewayVersion":"0.1.2","healthy":false,"compatibility":{"status":"unknown"}}`,
+		},
+		{
+			name: "gateway info only, unhealthy",
+			svc:  infoOnlyGatewayService{info: &models.GatewayInfo{Status: "UNHEALTHY", GatewayVersion: "0.1.2"}},
+			want: `{"gatewayVersion":"0.1.2","healthy":false,"compatibility":{"status":"unknown"}}`,
+		},
+		{
+			name: "gateway info only, without a status",
+			svc:  infoOnlyGatewayService{info: &models.GatewayInfo{GatewayVersion: "0.1.2"}},
+			want: `{"gatewayVersion":"0.1.2","compatibility":{"status":"unknown"}}`,
+		},
+		{
+			name: "gateway info only, answering with nothing",
+			svc:  infoOnlyGatewayService{},
+			want: `{"gatewayVersion":"","compatibility":{"status":"unknown"}}`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := NewGatewayHandler(tc.svc, auth.New(auth.Config{}), models.AuthConfigResponse{})
+			w := httptest.NewRecorder()
+			handler.GetGatewayCompatibility(w, httptest.NewRequest(http.MethodGet, "/gateway/compatibility", nil))
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+			}
+			if got := strings.TrimSpace(w.Body.String()); got != tc.want {
+				t.Errorf("body = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// infoOnlyGatewayService is a downstream gateway service written against
+// GatewayServiceInterface alone, before the verdict had a route of its own:
+// it has no GetGatewayVersion.
+type infoOnlyGatewayService struct {
+	info *models.GatewayInfo
+	err  error
+}
+
+func (s infoOnlyGatewayService) GetGatewayInfo(context.Context) (*models.GatewayInfo, error) {
+	return s.info, s.err
+}
+func (infoOnlyGatewayService) CheckHealth(context.Context) error { return nil }
+func (infoOnlyGatewayService) GetCurrentUser(context.Context) (*models.CurrentUser, error) {
+	return &models.CurrentUser{}, nil
+}
+
+// Such a service still compiles and still gets a verdict, from the only
+// version source it has. That source is admin-only, so its refusal is relayed.
+func TestGetGatewayCompatibilityFallsBackToGatewayInfo(t *testing.T) {
+	support, err := models.ParseGatewaySupport("0.1.0", "0.1.2")
+	if err != nil {
+		t.Fatalf("ParseGatewaySupport: %v", err)
+	}
+	get := func(svc services.GatewayServiceInterface) *httptest.ResponseRecorder {
+		handler := NewGatewayHandler(svc, auth.New(auth.Config{}), models.AuthConfigResponse{})
+		handler.SetGatewaySupport(support)
+		w := httptest.NewRecorder()
+		handler.GetGatewayCompatibility(w, httptest.NewRequest(http.MethodGet, "/gateway/compatibility", nil))
+		return w
+	}
+
+	w := get(infoOnlyGatewayService{info: &models.GatewayInfo{Status: "HEALTHY", GatewayVersion: "0.0.116"}})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	const want = `{"gatewayVersion":"0.0.116","healthy":true,"compatibility":{"status":"unsupported","supportedMin":"0.1.0","supportedMax":"0.1.2"}}`
+	if got := strings.TrimSpace(w.Body.String()); got != want {
+		t.Errorf("body = %s, want %s", got, want)
+	}
+
+	w = get(infoOnlyGatewayService{err: &openshell.StatusError{Code: openshell.ErrorPermissionDenied, Message: "role 'openshell-admin' required"}})
+	if w.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want 403 relayed from GetGatewayInfo; body: %s", w.Code, w.Body.String())
+	}
+
+	// A service that answers with nothing has no version to judge.
+	w = get(infoOnlyGatewayService{})
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"status":"unknown"`) {
+		t.Errorf("nil info: status = %d, body = %s; want 200 with status unknown", w.Code, w.Body.String())
 	}
 }
 
@@ -101,5 +668,45 @@ func TestGetWhoAmIAuthDisabled(t *testing.T) {
 	}
 	if body["subject"] != "dev-user" {
 		t.Errorf("subject = %v", body["subject"])
+	}
+}
+
+// versionOverridingGateway is a downstream service of the kind
+// services.GatewayServiceInterface describes: it embeds the upstream one and
+// answers one method itself.
+type versionOverridingGateway struct {
+	*services.GatewayService
+	version string
+}
+
+func (g *versionOverridingGateway) GetGatewayVersion(context.Context) (string, error) {
+	return g.version, nil
+}
+
+// A downstream service that embeds the upstream one and answers the version
+// itself inherits GetGatewayHealth without having written it. Its version is
+// the one served and judged; only the health comes from the health check.
+func TestGetGatewayCompatibilityKeepsADownstreamVersion(t *testing.T) {
+	sdk := &mockSDK{}
+	sdk.health.checkFn = func(context.Context) (*openshell.HealthResult, error) {
+		return &openshell.HealthResult{Healthy: true, Version: "0.0.1"}, nil
+	}
+	svc := &versionOverridingGateway{GatewayService: services.NewGatewayService(sdk), version: "9.9.9-downstream"}
+	handler := NewGatewayHandler(svc, auth.New(auth.Config{}), models.AuthConfigResponse{})
+
+	w := httptest.NewRecorder()
+	handler.GetGatewayCompatibility(w, httptest.NewRequest(http.MethodGet, "/gateway/compatibility", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	var got models.GatewayCompatibilityInfo
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v; body: %s", err, w.Body.String())
+	}
+	if got.GatewayVersion != "9.9.9-downstream" {
+		t.Errorf("gatewayVersion = %q, want the downstream service's own answer", got.GatewayVersion)
+	}
+	if got.Healthy == nil || !*got.Healthy {
+		t.Errorf("healthy = %v, want true from the health check", got.Healthy)
 	}
 }

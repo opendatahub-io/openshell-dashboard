@@ -23,6 +23,7 @@ import {
   NavItem,
   NavList,
   Page,
+  PageSection,
   PageSidebar,
   PageSidebarBody,
   PageToggleButton,
@@ -43,6 +44,9 @@ import openshellLogoDark from '~/assets/openshell-logo-dark.svg';
 import { useGatewayInfo } from '../api/gateway';
 import { useCurrentUser, useFeatureFlags } from '../api/auth';
 import { useUserRole } from '../api/rbac';
+import CurrentUserModal from '../components/CurrentUserModal';
+import GatewayCompatibilityAlert from '../components/GatewayCompatibilityAlert';
+import GatewayStatusIndicator from '../components/GatewayStatusIndicator';
 import { useI18n } from '../i18n';
 import { logout } from './logout';
 import { useTheme } from './theme';
@@ -54,7 +58,12 @@ type AppLayoutProps = {
 type NavEntry = {
   path: string;
   labelKey:
-    'nav.gateway' | 'nav.workspaces' | 'nav.globalPolicy' | 'nav.settings';
+    | 'nav.gateway'
+    | 'nav.workspaces'
+    | 'nav.allWorkspaces'
+    | 'nav.providerProfiles'
+    | 'nav.globalPolicy'
+    | 'nav.settings';
   adminOnly?: boolean;
   featureKey?: keyof import('../types').FeatureFlags;
 };
@@ -62,6 +71,12 @@ type NavEntry = {
 const navEntries: NavEntry[] = [
   { path: '/gateway', labelKey: 'nav.gateway', adminOnly: true },
   { path: '/workspaces', labelKey: 'nav.workspaces' },
+  { path: '/all-workspaces', labelKey: 'nav.allWorkspaces', adminOnly: true },
+  {
+    path: '/provider-profiles',
+    labelKey: 'nav.providerProfiles',
+    adminOnly: true,
+  },
   {
     path: '/global-policy',
     labelKey: 'nav.globalPolicy',
@@ -86,6 +101,7 @@ const AppLayout: React.FC<AppLayoutProps> = ({ children }) => {
   const [isAboutOpen, setAboutOpen] = useState(false);
   const [isHelpOpen, setHelpOpen] = useState(false);
   const [isUserOpen, setUserOpen] = useState(false);
+  const [isIdentityOpen, setIdentityOpen] = useState(false);
   const { theme, toggleTheme } = useTheme();
   const logoSrc = theme === 'dark' ? openshellLogoDark : openshellLogo;
 
@@ -121,7 +137,10 @@ const AppLayout: React.FC<AppLayoutProps> = ({ children }) => {
       <MastheadContent>
         <Toolbar isFullHeight isStatic aria-label={t('header.actions')}>
           <ToolbarContent>
-            <ToolbarItem align={{ default: 'alignEnd' }}>
+            <ToolbarItem align={{ default: 'alignEnd' }} alignSelf="center">
+              <GatewayStatusIndicator />
+            </ToolbarItem>
+            <ToolbarItem>
               <Button
                 variant="plain"
                 onClick={toggleTheme}
@@ -196,6 +215,13 @@ const AppLayout: React.FC<AppLayoutProps> = ({ children }) => {
                       {t('header.copySubject')}
                     </DropdownItem>
                   )}
+                  <DropdownItem
+                    key="identity"
+                    onClick={() => setIdentityOpen(true)}
+                    data-testid="view-identity"
+                  >
+                    {t('header.identity')}
+                  </DropdownItem>
                   <Divider key="divider" />
                   <DropdownItem
                     key="logout"
@@ -243,7 +269,22 @@ const AppLayout: React.FC<AppLayoutProps> = ({ children }) => {
 
   return (
     <Page masthead={masthead} sidebar={sidebar} isManagedSidebar>
+      {/* Above every route, so an unsupported gateway is explained on the
+          same screen as the errors it causes, for every signed-in user. It
+          lives here rather than in a page so that it stays mounted across
+          navigation and is announced once, when it appears. The title is not
+          a heading: it sits above each page's h1, where a heading would break
+          the outline. Wrapped in a section only when shown. */}
+      <GatewayCompatibilityAlert
+        component="div"
+        wrapper={(alert) => <PageSection>{alert}</PageSection>}
+      />
       {children}
+      <CurrentUserModal
+        user={user.data}
+        isOpen={isIdentityOpen}
+        onClose={() => setIdentityOpen(false)}
+      />
       <AboutModal
         isOpen={isAboutOpen}
         onClose={() => setAboutOpen(false)}

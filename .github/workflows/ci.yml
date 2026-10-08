@@ -91,66 +91,86 @@ jobs:
           path: frontend/cypress/screenshots
           if-no-files-found: ignore
 
-  # Gateway compatibility matrix.
+  # Gateway compatibility (ADR 0005 as amended by ADR 0006).
   #
-  # The BFF pins its SDK in go.mod; the gateway is a separate artifact with its
-  # own release cadence. These drift silently, which is how the Sep 2026
-  # breaking changes reached main unnoticed. This job runs the Go compat suite
-  # (backend/test/compat) against several real gateway versions.
+  # The version chain is gateway -> SDK -> BFF -> UI, and each link is proven
+  # separately. The two jobs below prove the WIRE link (gateway<->SDK), which
+  # nothing but a real gateway can prove: the newest gateway is not assumed to
+  # work with the newest SDK, in either direction. The SOURCE link (SDK<->BFF)
+  # is check-backend's job — the compiler and the unit tests.
   #
-  # `required: true` lanes block the build; advisory lanes may fail.
+  # compat-pins reads deploy/ci/gateway-pins.json, the one place the supported
+  # gateways are written down, and fails fast when that file is malformed: no
+  # required lane, a lane image without @sha256:, a version that is not x.y.z,
+  # a dev lane, or an `sdk` field that disagrees with backend/go.mod.
   #
-  # The gateway and the Go SDK are WIRE-COUPLED: the Sep 2026 SDK renumbered
-  # CreateSandboxRequest's protobuf fields, moving workspace_scope from field 8
-  # to field 7 — where older gateways expect a string. An older gateway then
-  # reads the serialized WorkspaceSelector as a workspace name and reports
-  # `workspace '\n\adefault' not found`. Every workspace-scoped call fails.
-  # They must be upgraded together.
-  #
-  # The gateway's own TOML config is versioned too, and the schemas are
-  # mutually exclusive: `dev` requires v2, releases up to 0.0.116 require v1.
-  # Each lane therefore selects its config template.
-  # Reads deploy/ci/gateway-pins.json so the pins live in one place the compat
-  # sweep's automated bump PR can edit structurally, rather than being buried
-  # in this matrix.
+  # The supported range is DERIVED, never restated: the floor is the lowest
+  # and the ceiling the highest `version` among the lanes with required=true.
   compat-pins:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       lanes: ${{ steps.read.outputs.lanes }}
+      sandbox_image: ${{ steps.read.outputs.sandbox_image }}
+      supported_min: ${{ steps.read.outputs.supported_min }}
+      supported_max: ${{ steps.read.outputs.supported_max }}
     steps:
       - uses: actions/checkout@v4
+      # The validator below and the scheduled sweep share this code. A second
+      # of unit tests here keeps both honest on every PR.
+      - name: Unit-test the pins and sweep logic
+        run: python3 -m unittest discover -s deploy/ci/sweep
+      - name: Validate the pins file
+        run: python3 deploy/ci/sweep/sweep.py validate-pins deploy/ci/gateway-pins.json --go-mod backend/go.mod
       - id: read
         run: |
           set -euo pipefail
           echo "lanes=$(jq -c '.lanes' deploy/ci/gateway-pins.json)" >> "$GITHUB_OUTPUT"
-          jq -r '"floor=\(.floor)  floor_release=\(.floor_release)  sdk=\(.sdk)"' deploy/ci/gateway-pins.json
+          echo "sandbox_image=$(jq -er '.sandbox_image' deploy/ci/gateway-pins.json)" >> "$GITHUB_OUTPUT"
+          # The supported range, derived from the required lanes. The compat
+          # lanes start the BFF with it, the way a released image carries it.
+          python3 deploy/ci/sweep/sweep.py range deploy/ci/gateway-pins.json \
+            | python3 -c 'import json, sys; r = json.load(sys.stdin); print("supported_min=" + r["floor"]); print("supported_max=" + r["ceiling"])' \
+            >> "$GITHUB_OUTPUT"
 
-  # Gateway compatibility. Lanes come from deploy/ci/gateway-pins.json.
+  # One job per lane in deploy/ci/gateway-pins.json.
   #
-  # A PR tests the PIN — the gateway this dashboard claims to work with — and
-  # nothing else. Looking around at other releases is the scheduled sweep's
-  # job (compat-sweep.yml), not something every PR should pay for.
+  # A PR tests the PINS — the oldest and the newest released gateway this
+  # dashboard claims to work with — and nothing else. Looking at other
+  # releases, at upstream HEAD and at newer SDKs is the scheduled sweep's job
+  # (compat-sweep.yml), not something every PR should pay for.
   #
-  # An advisory lane pinned to an OLDER release is a trap: the SDK only moves
-  # forward, so such a lane is red forever rather than being a canary. If you
-  # add an advisory lane, make it one that can actually change state.
+  # Lanes are RELEASES pinned by digest. A `dev` gateway resolves a moving
+  # ghcr.io/nvidia/openshell/sandbox:dev image at runtime, so even a
+  # digest-pinned dev lane drifts with upstream HEAD — that is what turned
+  # this job red on main on 2026-10-02 with no change on our side.
   #
   # `required: true` lanes block the build; advisory lanes may fail.
   #
-  # The gateway and the Go SDK are WIRE-COUPLED: the Sep 2026 SDK renumbered
-  # CreateSandboxRequest's protobuf fields, moving workspace_scope from field 8
-  # to field 7 — where older gateways expect a string. An older gateway then
-  # reads the serialized WorkspaceSelector as a workspace name and reports
-  # `workspace '\n\adefault' not found`. Every workspace-scoped call fails.
-  # They must be upgraded together. See ADR 0005.
+  # Why the wire link cannot be assumed: between 0.0.116 and 0.1.0 upstream
+  # replaced `string workspace` on every request with a WorkspaceSelector
+  # message, and 0.1.0 put it at the field numbers the string had
+  # (GetSandboxRequest 2, ListSandboxesRequest 4, ...). A 0.0.116 gateway
+  # therefore reads the serialized selector as a workspace NAME and reports
+  # `workspace '\n\adefault' not found` on every workspace-scoped call. That
+  # gateway is served by dashboard v0.2.0 and its 0.2.x maintenance line, not
+  # by main (ADR 0006).
+  #
+  # A wire break is not always that loud. Dashboard v0.3.0 sent the selector
+  # at field numbers 0.0.116 does not know; protobuf dropped them, every
+  # request landed in the `default` workspace, and nothing failed. These lanes
+  # prove what the compat suite varies, and only that.
   #
   # The gateway's own TOML config is versioned too, and the schemas are
-  # mutually exclusive: `dev` requires v2, releases up to 0.0.116 require v1.
-  # Each lane therefore selects its config template.
+  # mutually exclusive: 0.1.0 and newer require v2, releases up to 0.0.116
+  # require v1. Each lane therefore names its config template.
   compat:
     name: compat (gateway ${{ matrix.label }})
     needs: compat-pins
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     continue-on-error: ${{ !matrix.required }}
     strategy:
       fail-fast: false
@@ -158,25 +178,36 @@ jobs:
         include: ${{ fromJSON(needs.compat-pins.outputs.lanes) }}
     env:
       # The community sandbox image publishes no semver tags, so it is pinned
-      # by digest and held constant across the matrix: we are varying the
-      # gateway, not the workload.
-      COMPAT_SANDBOX_IMAGE: ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+      # by digest in gateway-pins.json and held constant across the matrix: we
+      # are varying the gateway, not the workload.
+      COMPAT_SANDBOX_IMAGE: ${{ needs.compat-pins.outputs.sandbox_image }}
+      # Read by deploy/ci/e2e-stack.sh. Passed through env rather than written
+      # into the scripts below, so no workflow expression is ever expanded
+      # inside a shell command.
+      OPENSHELL_GATEWAY_IMAGE: ${{ matrix.gateway_image }}
+      OPENSHELL_SUPERVISOR_IMAGE: ${{ matrix.supervisor_image }}
+      OPENSHELL_CONFIG_SCHEMA: ${{ matrix.config_schema }}
+      # The BFF under test gets the supported range, exactly as a released
+      # image does, and a required lane then has to be judged "supported":
+      # every required lane is inside the range by construction, so any other
+      # verdict means the version comparison, the range derivation or the
+      # gateway's version report broke. An advisory lane may sit outside the
+      # range, so nothing is asserted for it.
+      GATEWAY_SUPPORTED_MIN: ${{ needs.compat-pins.outputs.supported_min }}
+      GATEWAY_SUPPORTED_MAX: ${{ needs.compat-pins.outputs.supported_max }}
+      COMPAT_EXPECT_COMPATIBILITY: ${{ matrix.required && 'supported' || '' }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Pull images
         run: |
           set -euo pipefail
-          docker pull "${{ matrix.gateway_image }}"
-          docker pull "${{ matrix.supervisor_image }}"
+          docker pull "$OPENSHELL_GATEWAY_IMAGE"
+          docker pull "$OPENSHELL_SUPERVISOR_IMAGE"
           docker pull "$COMPAT_SANDBOX_IMAGE"
           echo "sandbox image digest: $(docker image inspect "$COMPAT_SANDBOX_IMAGE" --format '{{index .RepoDigests 0}}' 2>/dev/null || echo unknown)"
 
       - name: Start gateway stack
-        env:
-          OPENSHELL_GATEWAY_IMAGE: ${{ matrix.gateway_image }}
-          OPENSHELL_SUPERVISOR_IMAGE: ${{ matrix.supervisor_image }}
-          OPENSHELL_CONFIG_SCHEMA: ${{ matrix.config_schema }}
         run: |
           set -euo pipefail
           # Sandbox containers are created by the gateway on the host daemon,
@@ -205,10 +236,14 @@ jobs:
           curl -sf http://localhost:9080/api/v1/healthz >/dev/null
           echo "BFF is healthy"
 
+      # -count=1 is load-bearing. The suite talks to a live gateway, which Go's
+      # test cache cannot see: with identical test inputs it replays a previous
+      # pass as "ok (cached)" without sending a single request — and setup-go
+      # restores GOCACHE between runs. Never let a cached result stand in.
       - name: Run compat suite
         env:
           BFF_URL: http://localhost:9080
-        run: cd backend && go test -tags compat -v -timeout 20m ./test/compat/...
+        run: cd backend && go test -tags compat -count=1 -v -timeout 20m ./test/compat/...
 
       - name: Gateway logs on failure
         if: failure()
@@ -232,6 +267,21 @@ jobs:
             runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      # The image states which gateways it supports, as two env vars the BFF
+      # can read and as labels. The values come from the same script that
+      # writes the release notes and stamps the npm package, which derives them
+      # from the required compat lanes — nothing here is typed by hand, and a
+      # pins file that yields no range fails the build rather than shipping an
+      # image that claims nothing.
+      - name: Derive the supported gateway range
+        id: range
+        run: |
+          # pipefail, or a failing derivation would hide behind tee's exit 0.
+          set -euo pipefail
+          node scripts/gateway-range.mjs --format github | tee -a "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         if: env.PUBLISH_IMAGE == 'true'
@@ -250,6 +300,10 @@ jobs:
           file: deploy/Dockerfile
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            GATEWAY_SUPPORTED_MIN=${{ steps.range.outputs.floor }}
+            GATEWAY_SUPPORTED_MAX=${{ steps.range.outputs.ceiling }}
+            OPENSHELL_SDK_VERSION=${{ steps.range.outputs.sdk }}
           cache-from: type=gha,scope=${{ matrix.platform }}
           cache-to: type=gha,scope=${{ matrix.platform }},mode=max
           outputs: ${{ env.PUBLISH_IMAGE == 'true' && 'type=image,name=quay.io/gkrumbach07/openshell-dashboard,push-by-digest=true,name-canonical=true,push=true' || '' }}
@@ -267,6 +321,16 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # Joins the two per-platform images into one multi-arch image and tags it with
+  # the commit (and the PR number, on a pull request). It needs only `build`,
+  # deliberately: these tags say "this is what that commit built", which is true
+  # whether or not the commit is any good, and they are how a pull request gets
+  # an image to try before its checks finish.
+  #
+  # It does NOT tag `latest`. That tag is a recommendation, and it used to move
+  # here — on every push to main, with only `build` to wait for — so it could
+  # and did point at a commit whose required compat lane had failed.
+  # `promote-latest` below moves it, once everything has passed.
   push-manifest:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
@@ -287,9 +351,11 @@ jobs:
         id: meta
         with:
           images: quay.io/gkrumbach07/openshell-dashboard
+          # sha-<first 7 characters of the commit> is how every later tag finds
+          # this image: promote-latest below, and the version tags publish.yml
+          # adds when a release is cut. Keep the format in step with both.
           tags: |
-            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
-            type=sha,prefix=sha-
+            type=sha,prefix=sha-,format=short
             type=ref,event=pr,prefix=pr-
       - name: Create and push multi-arch manifest
         working-directory: /tmp/digests
@@ -297,3 +363,108 @@ jobs:
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf 'quay.io/gkrumbach07/openshell-dashboard@sha256:%s ' *)
+
+  # Reads the image that push-manifest just pushed back from the registry and
+  # checks that it declares the supported gateway range on both platforms.
+  #
+  # Nothing else would notice if it did not. The Dockerfile's build args default
+  # to the empty string so that a plain `docker build` works, which also means a
+  # misspelt arg name in the build job above is not an error: the image is
+  # published claiming nothing. This inspects the image config; it does not pull
+  # or run the image.
+  image-range:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    needs: [push-manifest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: docker/setup-buildx-action@v3
+      - name: The pushed image declares the supported gateway range
+        run: node scripts/check-image-range.mjs "quay.io/gkrumbach07/openshell-dashboard:sha-${GITHUB_SHA::7}"
+
+  # `latest` only moves to a commit that passed everything, and only forward.
+  #
+  # This is a retag, not a build: it points `latest` at the digest that
+  # push-manifest already pushed as sha-<commit>, so `latest` is byte-for-byte
+  # the image built for the commit whose jobs passed, not a later rebuild of it.
+  # On a pull request, or if any job in `needs` fails or is cancelled, this job
+  # is skipped and `latest` stays where it was.
+  #
+  # "Passed everything" is not enough on its own. A run can be re-run for
+  # thirty days and keeps the commit it was started for, and this job depends on
+  # every other job, so re-running a failed job on an OLDER run of main runs
+  # this one too. Without the tip check below, "Re-run failed jobs" on last
+  # week's flaky run would finish green and pull `latest` back to last week. So
+  # the job first asks the remote whether its commit is still the tip of main,
+  # and when it is not it stands down: it succeeds, touches nothing and never
+  # logs in to the registry. The run for the tip is the one that promotes.
+  #
+  # publish.yml only runs after this workflow succeeds on main, so by the time
+  # a release is cut `latest` and the new X.Y.Z tag name the same digest.
+  promote-latest:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    needs: [push-manifest, image-range, check-frontend, check-backend, e2e, compat, release-tooling]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Is this commit still the tip of main?
+        id: tip
+        run: |
+          # pipefail, or a failing check would hide behind tee's exit 0.
+          set -euo pipefail
+          scripts/branch-tip.sh origin main "$GITHUB_SHA" | tee -a "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+        if: steps.tip.outputs.is_tip == 'true'
+      - uses: docker/login-action@v3
+        if: steps.tip.outputs.is_tip == 'true'
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_ROBOT_TOKEN }}
+      - name: Point latest at this commit's image
+        if: steps.tip.outputs.is_tip == 'true'
+        run: scripts/retag-image.sh quay.io/gkrumbach07/openshell-dashboard "sha-${GITHUB_SHA::7}" latest
+
+  # The release pipeline (publish.yml, release.config.cjs, scripts/release/)
+  # runs for real only on main, after a merge. This job is where a mistake in it
+  # is caught beforehand, and it is also where the supported gateway range is
+  # kept honest:
+  #
+  #   - the range can be derived from the pins, and the SDK the pins name is the
+  #     one backend/go.mod builds against
+  #   - the README's Compatibility section states that range (it is generated;
+  #     this fails when someone moved the pins and did not regenerate it)
+  #   - the scripts that write release notes, stamp package.json, detect a
+  #     release, decide whether `latest` may move and retag the image do what
+  #     they say, against a stand-in docker and a throwaway git remote
+  #   - release.config.cjs loads in the semantic-release that publish.yml runs,
+  #     its rules cut the releases CONTRIBUTING.md says they cut, and the
+  #     release notes list a commit exactly when it cuts one
+  release-tooling:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Supported gateway range
+        run: node scripts/gateway-range.mjs --check
+      - name: README states the supported gateway range
+        run: node scripts/readme-gateway-range.mjs --check
+      - name: Release script tests
+        run: node --test "scripts/**/*.test.mjs"
+      - name: Release configuration and rules
+        run: |
+          set -euo pipefail
+          # Check against the semantic-release that will actually run. The
+          # version lives in publish.yml and nowhere else.
+          spec="$(grep -oE 'semantic-release@[0-9]+\.[0-9]+\.[0-9]+' .github/workflows/publish.yml | sort -u || true)"
+          if [ "$(printf '%s' "$spec" | grep -c . || true)" -ne 1 ]; then
+            echo "::error::expected exactly one pinned semantic-release version in publish.yml, found: ${spec:-none}"
+            exit 1
+          fi
+          npm install --no-audit --no-fund --no-package-lock --prefix "$RUNNER_TEMP/semantic-release" "$spec"
+          node scripts/release/check-release-config.mjs --from "$RUNNER_TEMP/semantic-release"

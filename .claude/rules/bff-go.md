@@ -31,7 +31,9 @@ backend/
 │   │   └── proxy.go           # Token extraction from headers
 │   ├── clients/               # Narrow SDK escape hatches
 │   │   ├── auth.go            # Per-request bearer forwarding
-│   │   └── rawexec.go         # Non-TTY stdin exec for binary uploads
+│   │   ├── rawexec.go         # Non-TTY stdin exec for binary uploads
+│   │   ├── rawprovider.go     # Keys of the credentials a provider holds
+│   │   └── rawprofile.go      # Provider profiles, whole (endpoints included)
 │   └── models/                # Response DTOs and request builders
 │       ├── models.go          # DTOs shared with the frontend
 │       ├── auth.go            # AuthConfigResponse, FeatureFlags
@@ -72,11 +74,37 @@ SDK sub-clients once (`Sandboxes()`, `Workspaces()`, `Providers()`, `Exec()`,
 that interface into the handler as `h.svc`. Downstream can substitute its own
 implementation of any `services.*Interface` without forking the handler.
 
-The one intentional exception is `pkg/clients/rawexec.go`: it uses the
-SDK's generated proto client for binary-safe uploads because the public exec API
-still lacks a non-TTY stdin path. Do not add new local wrappers, copied protos,
-or generated stub trees unless there is a concrete upstream SDK gap you can
-point to.
+The three intentional exceptions are in `pkg/clients`, and all use the SDK's
+generated proto client because of a gap in the public SDK:
+
+- `rawexec.go` streams a file into a sandbox for binary-safe uploads, because
+  the public exec API lacks a non-TTY stdin path.
+- `rawprovider.go` reads the keys of the credentials a provider holds, because
+  the SDK's converter drops the redacted `credentials` map the gateway returns
+  them in. `app.SetProviderCredentialKeys` wires it in; handlers reach it
+  through `services.ProviderCredentialKeyReader`, beside the SDK call that
+  returns the provider itself. `rawprovider_allworkspaces.go` is the same
+  read for the all-workspaces provider list.
+- `rawprofile.go` reads and writes provider profiles, because the SDK's
+  profile endpoint type keeps a host, a port and a protocol and drops the
+  access preset, enforcement and L7 rules the gateway stores with them. An
+  update replaces the stored profile, so a profile that went through the SDK
+  type would come back narrower than it was.
+
+Do not add new local wrappers, copied protos, or generated stub trees unless
+there is a concrete upstream SDK gap you can point to, and delete an exception
+when its gap closes.
+
+## Mirror the gateway
+
+The BFF translates nothing (see "Stay in parity with the gateway" in
+`CLAUDE.md`). A request body carries what the gateway's message carries and is
+forwarded as it is; a response carries what the gateway returned, minus
+secrets. When a request fails because the gateway wants it another way, change
+what the UI sends, not what the BFF forwards. In particular the BFF does not
+rename provider credential keys, work out a provider's profile scope, or guess
+the type of a setting, and it sends an update only what the request names
+rather than a resource it read first.
 
 ## Handlers
 
@@ -142,6 +170,8 @@ Env vars (some also available as CLI flags):
 | `AUTH_USER_HEADER` | `-auth-user-header` | `x-auth-request-user` | User header name |
 | `ADMIN_ROLE` | `-admin-role` | `admin` | OIDC role claim for admin (display gating only — gateway enforces) |
 | `LOGOUT_URL` | `-logout-url` | `/oauth2/sign_out` | Proxy sign-out path the frontend redirects to on logout |
+| `GATEWAY_SUPPORTED_MIN` | `-gateway-supported-min` | | Oldest gateway release this build supports, plain `x.y.z`. Set together with `GATEWAY_SUPPORTED_MAX`; with either unset or unparsable, `compatibility.status` is `unknown`. The verdict is served by `GET /gateway/compatibility` to every signed-in user (version read from the gateway's unauthenticated health check) and also rides on `GET /gateway`, which the gateway answers for platform admins only. Informational only — the BFF never blocks on it |
+| `GATEWAY_SUPPORTED_MAX` | `-gateway-supported-max` | | Newest gateway release this build was tested against, plain `x.y.z`. Both are derived from the required lanes in `deploy/ci/gateway-pins.json` (`make dev` does this) — never hand-write a range |
 | `FEATURE_*` | | varies | Feature flags: `FEATURE_TERMINAL`, `FEATURE_FILE_TRANSFER`, `FEATURE_SETTINGS`, `FEATURE_GLOBAL_POLICY`, `FEATURE_CREDENTIAL_REFRESH`, `FEATURE_SERVICES`, `FEATURE_DRAFT_POLICY` |
 
 ## Error handling
@@ -163,14 +193,53 @@ can return is declared there so the frontend has one authoritative list.
 - Table-driven tests with `*_test.go` adjacent to implementation
 - `httptest.NewRecorder()` + `http.NewRequest()` for handler tests
 - `mock_sdk_test.go` provides `openshell.ClientInterface` test doubles for handler coverage
-- `rawexec_test.go` covers the one low-level gRPC escape hatch separately
+- `rawexec_test.go`, `rawprovider_test.go` (with `rawprovider_allworkspaces_test.go`) and `rawprofile_test.go` cover the three low-level gRPC escape hatches against a fake gateway that enforces the real one's 1 MiB message limit
 - `slog` for structured logging
 
 ## SDK updates
 
+The SDK pin is the commit of an upstream **release tag** and it moves in a PR
+of its own. Never `go get ...@latest`, a branch or a pre-release tag: `@latest`
+is whatever upstream HEAD is that minute, and nothing was tested against it
+(ADR 0006; hard facts 17 and 20 in `openshell-api.md`).
+
+You normally do not do this by hand. The daily compat sweep tries the newest
+release's SDK against every required gateway lane and proposes the PR when it
+passes (`fix(sdk): move to the OpenShell SDK at vX`, on the branch
+`compat-sweep/sdk`). When it reports a **source migration** instead — the BFF
+no longer builds against the new SDK — that is the one case for doing it
+yourself:
+
 ```bash
-go get github.com/NVIDIA/OpenShell/sdk/go@latest
+# The commit a release tag points at (take the ^{} line when the tag has one).
+git ls-remote --tags https://github.com/NVIDIA/OpenShell.git 'v0.1.*'
+
+cd backend
+go get github.com/NVIDIA/OpenShell/sdk/go@<release-tag-commit>
+go mod tidy
+go build ./... && go vet ./... && go test ./...   # the source link: SDK <-> BFF
 ```
+
+Then, in the same PR:
+
+- Write the new version into the `sdk` field of `deploy/ci/gateway-pins.json`.
+  It is the go.mod pin recorded a second time and CI fails when they differ
+  (`python3 deploy/ci/sweep/sweep.py validate-pins --go-mod backend/go.mod`).
+- Fix the call sites and the test doubles in `mock_sdk_test.go`, and commit
+  them with the pin: a commit that moves the SDK without them does not build.
+- Do **not** move a gateway lane. The required compat lanes prove the wire
+  link (gateway <-> SDK) against every gateway we support; a moved lane would
+  hide which link changed.
+- Use a `fix:` commit. The published BFF is built against the SDK, so the
+  move has to be released.
+
+If the new SDK fails the floor lane, moving to it drops a supported gateway.
+That is a decision about the supported range, not a dependency bump. Stop and
+raise it. The one case where the SDK and the lanes do move in a single PR is
+a wire break no build spans — the new SDK fails every required lane and the
+pinned SDK fails every new gateway — and that PR is a person's decision,
+recorded as such (ADR 0006, decision 6). It is never a routine update and the
+sweep never opens it.
 
 There is no local proto regeneration flow anymore. If you need to inspect an
 RPC or type shape, read the vendored SDK package (`openshell/v1`, `types/*`) or

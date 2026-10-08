@@ -23,11 +23,13 @@ import (
 type App struct { //nolint:govet // fieldalignment: readability over padding
 	// authConfig is serialized to the browser via GET /auth/config — never
 	// put secrets in it.
-	auth          *auth.Middleware
+	auth          auth.MiddlewareInterface
 	authConfig    models.AuthConfigResponse
 	staticDir     string
 	maxUploadSize int64
 	execTimeout   uint32
+
+	allWorkspaces *handlers.AllWorkspacesHandler
 
 	drafts     *handlers.DraftsHandler
 	files      *handlers.FilesHandler
@@ -41,10 +43,19 @@ type App struct { //nolint:govet // fieldalignment: readability over padding
 	terminal   *handlers.TerminalHandler
 	templates  *handlers.TemplatesHandler
 	workspaces *handlers.WorkspacesHandler
+
+	extensions []Extension
 }
 
 // NewApp builds the application.
-func NewApp(sdkClient openshell.ClientInterface, execUpload services.StdinExecer, authMiddleware *auth.Middleware, staticDir string, authCfg models.AuthConfigResponse) *App {
+func NewApp(
+	sdkClient openshell.ClientInterface,
+	execUpload services.StdinExecer,
+	authMiddleware auth.MiddlewareInterface,
+	staticDir string,
+	authCfg models.AuthConfigResponse,
+	extensions ...Extension,
+) *App {
 	app := &App{
 		auth:          authMiddleware,
 		authConfig:    authCfg,
@@ -59,6 +70,7 @@ func NewApp(sdkClient openshell.ClientInterface, execUpload services.StdinExecer
 	policySvc := services.NewPolicyService(sdkClient.Policy())
 
 	app.drafts = handlers.NewDraftsHandler(policySvc)
+	app.drafts.SetSandboxService(sandboxSvc)
 	app.files = handlers.NewFilesHandler(services.NewFileService(execUpload), execSvc, sandboxSvc, handlers.FilesHandlerConfig{ExecTimeout: app.execTimeout, MaxUploadSize: app.maxUploadSize})
 	app.gateway = handlers.NewGatewayHandler(services.NewGatewayService(sdkClient), authMiddleware, authCfg)
 	app.logs = handlers.NewLogsHandler(sandboxSvc)
@@ -70,8 +82,57 @@ func NewApp(sdkClient openshell.ClientInterface, execUpload services.StdinExecer
 	app.terminal = handlers.NewTerminalHandler(execSvc)
 	app.templates = handlers.NewTemplatesHandler(services.NewTemplateService(sdkClient))
 	app.workspaces = handlers.NewWorkspacesHandler(services.NewWorkspaceService(sdkClient.Workspaces()))
+	app.allWorkspaces = handlers.NewAllWorkspacesHandler(
+		sandboxSvc,
+		services.NewProviderService(sdkClient.Providers()),
+		services.NewTemplateService(sdkClient),
+		services.NewServiceService(sdkClient.Services()),
+	)
+	app.extensions = extensions
 
 	return app
+}
+
+// SetGatewaySupport declares the range of gateway releases this build
+// supports. GET /gateway/compatibility (for every signed-in user) and
+// GET /gateway (for platform admins) then report where the connected gateway
+// falls relative to it; without a range they report "unknown". Nothing is
+// ever blocked on the result.
+//
+// It is a method rather than a NewApp parameter because NewApp's trailing
+// parameter is already the variadic extension list, and downstream callers of
+// NewApp must keep compiling. Call it before Routes.
+func (app *App) SetGatewaySupport(support models.GatewaySupport) {
+	app.gateway.SetGatewaySupport(support)
+}
+
+// SetProviderCredentialKeys gives the app the way to read which credentials
+// each provider holds, so that provider lists and details can name them. The
+// gateway reports those keys and the SDK drops them; clients.RawExecClient
+// reads them from the gateway's own answer. Without it providers are returned
+// with no credential names against gateways 0.1.x.
+//
+// Like SetGatewaySupport it is a method rather than a NewApp parameter so that
+// downstream callers of NewApp keep compiling. Call it before Routes.
+func (app *App) SetProviderCredentialKeys(keys services.ProviderCredentialKeyReader) {
+	app.providers.SetCredentialKeyReader(keys)
+	app.logs.SetCredentialKeyReader(keys)
+	app.allWorkspaces.SetCredentialKeyReader(keys)
+}
+
+// SetProviderProfiles gives the app the way to read and write provider
+// profiles with their endpoints whole: the access preset, enforcement and L7
+// rules that bound a provider's traffic. The SDK carries a host, a port and a
+// protocol of each endpoint; clients.RawExecClient uses the gateway's own
+// message. Without it profiles are returned without networkEndpoints, a
+// profile that sets more on an endpoint cannot be imported, and an update
+// drops whatever the stored profile's endpoints held beyond those three
+// fields.
+//
+// Like SetGatewaySupport it is a method rather than a NewApp parameter so that
+// downstream callers of NewApp keep compiling. Call it before Routes.
+func (app *App) SetProviderProfiles(profiles services.ProviderProfileStore) {
+	app.providers.SetProfileStore(profiles)
 }
 
 // Routes builds the chi router.
@@ -93,17 +154,42 @@ func (app *App) Routes() http.Handler {
 
 			r.Get("/auth/whoami", app.gateway.GetWhoAmI)
 			r.Get("/gateway", app.gateway.GetGateway)
+			// The verdict on its own: /gateway carries it too, but the
+			// gateway only answers that one for platform admins.
+			r.Get("/gateway/compatibility", app.gateway.GetGatewayCompatibility)
+			// Pending draft chunks per sandbox: of one workspace with
+			// ?workspace=, of every workspace without (platform admins only).
 			r.Get("/draft-summary", app.drafts.GetDraftSummary)
 
 			r.Route("/global-policy", func(r chi.Router) {
 				r.Get("/", app.policies.GetGlobalPolicy)
 				r.Put("/", app.policies.SetGlobalPolicy)
+				r.Get("/revisions/{version}", app.policies.GetGlobalPolicyRevision)
 			})
 
 			r.Get("/settings/global", app.settings.GetGlobalSettings)
 			r.Put("/settings/global", app.settings.SetGlobalSetting)
 			r.Delete("/settings/global", app.settings.DeleteGlobalSetting)
 			r.Delete("/global-policy", app.policies.DeleteGlobalPolicy)
+
+			// Lists across every workspace (the CLI's --all-workspaces). The
+			// gateway answers them for platform admins only.
+			r.Get("/sandboxes", app.allWorkspaces.ListSandboxes)
+			r.Get("/providers", app.allWorkspaces.ListProviders)
+			r.Get("/templates", app.allWorkspaces.ListSandboxTemplates)
+			r.Get("/services", app.allWorkspaces.ListServices)
+
+			// Platform-scoped provider profiles, which every workspace sees.
+			// The handlers are the ones that serve a workspace's own profiles
+			// below, told to address the platform scope; the gateway answers
+			// these for platform admins only.
+			platform := app.providers.InPlatformScope
+			r.Get("/provider-profiles", platform(app.providers.ListProviderProfiles))
+			r.Post("/provider-profiles", platform(app.providers.ImportProviderProfiles))
+			r.Post("/provider-profiles/lint", platform(app.providers.LintProviderProfiles))
+			r.Get("/provider-profiles/{profileId}", platform(app.providers.GetProviderProfile))
+			r.Put("/provider-profiles/{profileId}", platform(app.providers.UpdateProviderProfile))
+			r.Delete("/provider-profiles/{profileId}", platform(app.providers.DeleteProviderProfile))
 
 			r.Route("/workspaces", func(r chi.Router) {
 				r.Get("/", app.workspaces.ListWorkspaces)
@@ -121,6 +207,8 @@ func (app *App) Routes() http.Handler {
 					r.Get("/templates/{name}", app.templates.GetSandboxTemplate)
 					r.Delete("/templates/{name}", app.templates.DeleteSandboxTemplate)
 
+					r.Get("/draft-summary", app.drafts.GetWorkspaceDraftSummary)
+
 					r.Get("/sandboxes", app.sandboxes.ListSandboxes)
 					r.Post("/sandboxes", app.sandboxes.CreateSandbox)
 					r.Post("/sandboxes/from-template", app.templates.CreateSandboxFromTemplate)
@@ -128,6 +216,9 @@ func (app *App) Routes() http.Handler {
 					r.Delete("/sandboxes/{name}", app.sandboxes.DeleteSandbox)
 					r.Post("/sandboxes/{name}/stop", app.sandboxes.StopSandbox)
 					r.Post("/sandboxes/{name}/start", app.sandboxes.StartSandbox)
+					r.Get("/sandboxes/{name}/settings", app.settings.GetSandboxSettings)
+					r.Put("/sandboxes/{name}/settings", app.settings.SetSandboxSetting)
+					r.Delete("/sandboxes/{name}/settings", app.settings.DeleteSandboxSetting)
 					r.Get("/sandboxes/{name}/logs", app.logs.GetSandboxLogs)
 					r.Get("/sandboxes/{name}/terminal", app.terminal.Terminal)
 					r.Get("/sandboxes/{name}/providers", app.logs.ListSandboxProviders)
@@ -135,6 +226,9 @@ func (app *App) Routes() http.Handler {
 					r.Delete("/sandboxes/{name}/providers/{provider}", app.logs.DetachSandboxProvider)
 					r.Get("/sandboxes/{name}/policy", app.policies.GetSandboxPolicy)
 					r.Put("/sandboxes/{name}/policy", app.policies.UpdateSandboxPolicy)
+					r.Post("/sandboxes/{name}/policy/merge", app.policies.MergeSandboxPolicy)
+					r.Get("/sandboxes/{name}/policy/effective", app.policies.GetEffectiveSandboxPolicy)
+					r.Get("/sandboxes/{name}/policy/revisions/{version}", app.policies.GetSandboxPolicyRevision)
 					r.Get("/sandboxes/{name}/drafts", app.drafts.GetDraftPolicy)
 					r.Post("/sandboxes/{name}/drafts/{chunk}/approve", app.drafts.ApproveDraftChunk)
 					r.Post("/sandboxes/{name}/drafts/{chunk}/reject", app.drafts.RejectDraftChunk)
@@ -149,6 +243,10 @@ func (app *App) Routes() http.Handler {
 					r.Get("/sandboxes/{name}/services", app.services.ListServices)
 					r.Post("/sandboxes/{name}/services", app.services.ExposeService)
 					r.Delete("/sandboxes/{name}/services/{svc}", app.services.DeleteService)
+					// Without a service name: the sandbox's unnamed endpoint.
+					r.Delete("/sandboxes/{name}/services", app.services.DeleteService)
+					// Without a sandbox name: every endpoint in the workspace.
+					r.Get("/services", app.services.ListServices)
 
 					r.Get("/providers", app.providers.ListProviders)
 					r.Post("/providers", app.providers.CreateProvider)
@@ -168,6 +266,10 @@ func (app *App) Routes() http.Handler {
 					r.Delete("/provider-profiles/{profileId}", app.providers.DeleteProviderProfile)
 				})
 			})
+
+			for _, extension := range app.extensions {
+				extension(r)
+			}
 		})
 	})
 

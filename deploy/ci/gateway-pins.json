@@ -1,30 +1,50 @@
 {
   "_comment": [
-    "Single source of truth for which gateways the compat suite runs against.",
-    "Read by the `compat` matrix in ci.yml and by the compat sweep, and edited",
-    "by the sweep's automated bump PR. Per ADR 0005 the SDK pin in",
-    "backend/go.mod and these pins move together in one change.",
+    "Which gateways this dashboard claims to work with, and the SDK it ships.",
+    "Read by the compat matrix in ci.yml, by the compat sweep and by",
+    "deploy/ci/e2e-stack.sh. See docs/adrs/0006-compat-links-and-sweep-axes.md.",
     "",
-    "PRs test the PIN and nothing else. Looking around \u2014 at newer releases \u2014 is",
-    "the scheduled sweep's job, not every PR's. Adding an advisory lane here is",
-    "possible but should be deliberate: a lane pinned to an older release can",
-    "never go green, because the SDK only moves forward.",
+    "The supported range is DERIVED, never written down: the floor is the",
+    "lowest and the ceiling the highest `version` among the lanes with",
+    "required=true. There is deliberately no floor or ceiling key to keep in",
+    "step with the lanes. `python3 deploy/ci/sweep/sweep.py range` prints it.",
     "",
-    "floor: the gateway the dashboard is pinned to.",
-    "floor_release: the newest RELEASED version at or below the pin. While the",
-    "pin is an unreleased dev build these differ; see ADR 0005."
+    "lanes: releases pinned by digest (tag@digest: the tag is for readers, the",
+    "digest is what gets pulled). Required lanes run on every PR. Never pin a",
+    "dev build: a dev gateway resolves ghcr.io/nvidia/openshell/sandbox:dev at",
+    "runtime, so a digest-pinned dev lane still drifts with upstream HEAD and",
+    "broke main on 2026-10-02. A release resolves sandbox:<its own version>.",
+    "",
+    "sdk: the exact version required in backend/go.mod, the commit of an",
+    "upstream release tag. CI fails when the two disagree.",
+    "",
+    "sandbox_image: the workload image compat sandboxes run. It publishes no",
+    "version tags, so it is pinned by digest and held constant across lanes.",
+    "",
+    "Two automated PRs edit this file and each touches one thing: the gateway",
+    "axis moves the ceiling lane, the SDK axis moves `sdk` (with go.mod).",
+    "`python3 deploy/ci/sweep/sweep.py validate-pins` checks the file, layout",
+    "included: those PRs rewrite all of it, so CI requires the exact form they",
+    "write. After a hand edit, `... sweep.py format-pins` puts it back."
   ],
-  "floor": "dev",
-  "floor_release": "0.0.116",
-  "sdk": "v0.0.0-20260923091534-d3480d2a7efa",
+  "sdk": "v0.0.0-20260928030816-6648bd0c290e",
+  "sandbox_image": "ghcr.io/nvidia/openshell-community/sandboxes/base:latest@sha256:aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e",
   "lanes": [
     {
-      "version": "dev",
-      "label": "dev @ 0.0.117-dev.259",
+      "version": "0.1.2",
+      "label": "0.1.2, newest tested",
       "required": true,
       "config_schema": "v2",
-      "gateway_image": "ghcr.io/nvidia/openshell/gateway@sha256:cd32f77ce59f66e9640aa3679173da1b4528d605c074d391ed232cf051764f5c",
-      "supervisor_image": "ghcr.io/nvidia/openshell/supervisor@sha256:d91d8cb1192a189cb53ea5dd105d1bb17499933b03ad8550879756a5cbf46f7e"
+      "gateway_image": "ghcr.io/nvidia/openshell/gateway:0.1.2@sha256:2fe4dad9118e14ab80a8258b545ea6e6cd74c3469e24ad4e6610f964d98913a2",
+      "supervisor_image": "ghcr.io/nvidia/openshell/supervisor:0.1.2@sha256:d7b5264bb6bc56f4796e6fa3617b8e4a8d785be0b7293542efd8cc250b0fb67a"
+    },
+    {
+      "version": "0.1.0",
+      "label": "0.1.0, oldest supported",
+      "required": true,
+      "config_schema": "v2",
+      "gateway_image": "ghcr.io/nvidia/openshell/gateway:0.1.0@sha256:9be15b267390fb73353b8862dade4dc13476f13175cf709e174d74bdf5f08e39",
+      "supervisor_image": "ghcr.io/nvidia/openshell/supervisor:0.1.0@sha256:cda950db60c83a770c54bfeea5326de8a3345c100938cc843b4537ab67a4e62f"
     }
   ]
 }

@@ -8,6 +8,9 @@ import {
   Content,
   Form,
   FormGroup,
+  FormHelperText,
+  HelperText,
+  HelperTextItem,
   Modal,
   ModalBody,
   ModalFooter,
@@ -24,56 +27,143 @@ import { Table, Tbody, Td, Th, Thead, Tr } from '@patternfly/react-table';
 import { PencilAltIcon, TrashIcon } from '@patternfly/react-icons';
 
 import ConfirmDeleteModal from '../components/ConfirmDeleteModal';
+import RefreshErrorAlert, {
+  isRefreshError,
+} from '../components/RefreshErrorAlert';
+import SettingValueField from '../components/SettingValueField';
 import { useAlerts } from '../app/AlertContext';
 import {
   useDeleteGlobalSetting,
   useGlobalSettings,
   useSetGlobalSetting,
 } from '../api/settings';
+import type { SettingEntry, SettingValue } from '../types';
+import {
+  emptySettingText,
+  formatSettingValue,
+  parseSettingValue,
+  settingTypeOf,
+  type SettingType,
+} from '../utils/settings';
+
+// A setting that is about to be written, waiting for the user to confirm it.
+// `from` is where it was entered, which is where a refusal is shown.
+type PendingSetting = {
+  key: string;
+  value: SettingValue;
+  from: 'add' | 'edit';
+};
+
+// The type a value is sent in, in words: "a string", "a boolean".
+const settingTypeLabel = (value: SettingValue): string => {
+  switch (settingTypeOf(value)) {
+    case 'boolean':
+      return 'a boolean';
+    case 'integer':
+      return 'an integer';
+    default:
+      return 'a string';
+  }
+};
 
 const SettingsPage: React.FC = () => {
   const settings = useGlobalSettings();
   const setSetting = useSetGlobalSetting();
   const deleteSetting = useDeleteGlobalSetting();
-  const { addSuccess } = useAlerts();
+  const { addAlert, addSuccess } = useAlerts();
 
   const [isAddOpen, setAddOpen] = useState(false);
   const [addKey, setAddKey] = useState('');
-  const [addValue, setAddValue] = useState('');
+  const [addType, setAddType] = useState<SettingType>('string');
+  const [addText, setAddText] = useState('');
 
+  // The gateway type-checks every setting, so a value is edited and sent as
+  // the type the setting takes. That type is the type of its current value;
+  // a setting that was never set has none to go by and the type is chosen.
   const [editKey, setEditKey] = useState<string | null>(null);
-  const [editValue, setEditValue] = useState('');
+  const [editType, setEditType] = useState<SettingType>('string');
+  const [isEditTypeKnown, setEditTypeKnown] = useState(false);
+  const [editText, setEditText] = useState('');
+
+  // A global setting reaches every sandbox on the gateway the moment it is
+  // written, so nothing is written before the user has seen exactly what
+  // will be and said yes to it, as in the TUI.
+  const [pending, setPending] = useState<PendingSetting | null>(null);
 
   const [deleteKey, setDeleteKey] = useState<string | null>(null);
 
   const openAdd = () => {
+    // Adding and editing share one mutation, so only one of them is open at a
+    // time: a refusal of the add must not show under a row being edited.
+    setEditKey(null);
     setAddKey('');
-    setAddValue('');
+    setAddType('string');
+    setAddText('');
     setSetting.reset();
     setAddOpen(true);
   };
 
-  const submitAdd = () => {
-    if (!addKey.trim()) return;
-    setSetting.mutate(
-      { key: addKey.trim(), value: addValue },
-      {
-        onSuccess: () => {
-          setAddOpen(false);
-          addSuccess(`Setting "${addKey.trim()}" saved`);
-        },
-      },
+  const addValue = parseSettingValue(addType, addText);
+  const editValue = parseSettingValue(editType, editText);
+
+  const startEdit = (entry: SettingEntry) => {
+    const known = settingTypeOf(entry.value);
+    const type = known ?? 'string';
+    setEditKey(entry.key);
+    setEditType(type);
+    setEditTypeKnown(known !== undefined);
+    setEditText(
+      entry.value === undefined ? emptySettingText(type) : String(entry.value),
     );
+    setSetting.reset();
+  };
+
+  const submitAdd = () => {
+    if (!addKey.trim() || addValue === undefined) return;
+    // The form makes way for the question and comes back, as it was, if the
+    // answer is no or the gateway refuses the value.
+    setAddOpen(false);
+    setSetting.reset();
+    setPending({ key: addKey.trim(), value: addValue, from: 'add' });
   };
 
   const submitEdit = () => {
-    if (!editKey) return;
+    if (!editKey || editValue === undefined) return;
+    setSetting.reset();
+    setPending({ key: editKey, value: editValue, from: 'edit' });
+  };
+
+  const cancelPending = () => {
+    if (pending?.from === 'add') {
+      setAddOpen(true);
+    }
+    setPending(null);
+  };
+
+  const confirmPending = () => {
+    if (!pending) return;
+    const { key, value, from } = pending;
     setSetting.mutate(
-      { key: editKey, value: editValue },
+      { key, value },
       {
         onSuccess: () => {
-          setEditKey(null);
-          addSuccess(`Setting "${editKey}" updated`);
+          setPending(null);
+          if (from === 'edit') {
+            setEditKey(null);
+          }
+          addSuccess(
+            from === 'add'
+              ? `Setting "${key}" saved`
+              : `Setting "${key}" updated`,
+          );
+        },
+        // The gateway's reason is shown where the value was entered, so that
+        // it can be corrected there: under the row, or in the form.
+        onError: () => {
+          setPending(null);
+          if (from === 'add') {
+            setAddOpen(true);
+          }
         },
       },
     );
@@ -82,9 +172,16 @@ const SettingsPage: React.FC = () => {
   const confirmDelete = () => {
     if (!deleteKey) return;
     deleteSetting.mutate(deleteKey, {
-      onSuccess: () => {
+      onSuccess: (result) => {
         setDeleteKey(null);
-        addSuccess(`Setting "${deleteKey}" deleted`);
+        // The gateway says whether there was anything to delete.
+        if (result.deleted) {
+          addSuccess(`Setting "${deleteKey}" deleted`);
+        } else {
+          addAlert(
+            `Setting "${deleteKey}" was not set, so nothing was deleted`,
+          );
+        }
       },
     });
   };
@@ -99,7 +196,10 @@ const SettingsPage: React.FC = () => {
     );
   }
 
-  if (settings.isError) {
+  // Only a first load that failed takes the page. A refresh that failed
+  // leaves the settings that loaded before on screen, with a note above them.
+  const refreshFailed = isRefreshError(settings);
+  if (settings.isError && !refreshFailed) {
     return (
       <PageSection>
         <Alert
@@ -129,6 +229,15 @@ const SettingsPage: React.FC = () => {
         </Content>
       </PageSection>
       <PageSection>
+        {refreshFailed && (
+          <RefreshErrorAlert
+            title="The settings could not be refreshed"
+            error={settings.error}
+            onRetry={() => settings.refetch()}
+            className="pf-v6-u-mb-md"
+            data-testid="settings-refresh-error"
+          />
+        )}
         <Toolbar aria-label="Settings actions">
           <ToolbarContent>
             <ToolbarItem>
@@ -170,17 +279,39 @@ const SettingsPage: React.FC = () => {
                           submitEdit();
                         }}
                       >
-                        <TextInput
-                          aria-label="Edit value"
-                          data-testid={`edit-value-${entry.key}`}
-                          value={editValue}
-                          onChange={(_e, val) => setEditValue(val)}
-                          // eslint-disable-next-line jsx-a11y/no-autofocus
-                          autoFocus
+                        <SettingValueField
+                          id={`edit-value-${entry.key}`}
+                          valueTestId={`edit-value-${entry.key}`}
+                          type={editType}
+                          canChooseType={!isEditTypeKnown}
+                          text={editText}
+                          onChange={(type, text) => {
+                            setEditType(type);
+                            setEditText(text);
+                          }}
+                          focusOnMount
                         />
+                        {(!isEditTypeKnown || setSetting.isError) && (
+                          <HelperText isLiveRegion>
+                            {!isEditTypeKnown && (
+                              <HelperTextItem>
+                                This setting has no value, so the gateway does
+                                not report its type. Choose the type it takes.
+                              </HelperTextItem>
+                            )}
+                            {setSetting.isError && (
+                              <HelperTextItem
+                                variant="error"
+                                data-testid={`edit-error-${entry.key}`}
+                              >
+                                {(setSetting.error as Error).message}
+                              </HelperTextItem>
+                            )}
+                          </HelperText>
+                        )}
                       </Form>
                     ) : (
-                      entry.value || '—'
+                      formatSettingValue(entry.value)
                     )}
                   </Td>
                   <Td dataLabel="Actions" isActionCell>
@@ -191,7 +322,9 @@ const SettingsPage: React.FC = () => {
                             variant="primary"
                             size="sm"
                             onClick={submitEdit}
-                            isDisabled={setSetting.isPending}
+                            isDisabled={
+                              editValue === undefined || setSetting.isPending
+                            }
                             isLoading={setSetting.isPending}
                             data-testid={`save-${entry.key}`}
                           >
@@ -215,11 +348,7 @@ const SettingsPage: React.FC = () => {
                           <Button
                             variant="plain"
                             aria-label={`Edit ${entry.key}`}
-                            onClick={() => {
-                              setEditKey(entry.key);
-                              setEditValue(entry.value);
-                              setSetting.reset();
-                            }}
+                            onClick={() => startEdit(entry)}
                             data-testid={`edit-${entry.key}`}
                           >
                             <PencilAltIcon />
@@ -284,12 +413,25 @@ const SettingsPage: React.FC = () => {
               />
             </FormGroup>
             <FormGroup label="Value" fieldId="setting-value">
-              <TextInput
+              <SettingValueField
                 id="setting-value"
-                data-testid="new-setting-value"
-                value={addValue}
-                onChange={(_e, val) => setAddValue(val)}
+                valueTestId="new-setting-value"
+                type={addType}
+                canChooseType
+                text={addText}
+                onChange={(type, text) => {
+                  setAddType(type);
+                  setAddText(text);
+                }}
               />
+              <FormHelperText>
+                <HelperText>
+                  <HelperTextItem>
+                    The gateway takes each setting in one type and rejects a
+                    value of any other.
+                  </HelperTextItem>
+                </HelperText>
+              </FormHelperText>
             </FormGroup>
           </Form>
           {setSetting.isError && (
@@ -298,6 +440,7 @@ const SettingsPage: React.FC = () => {
               isInline
               title="Failed to save setting"
               className="pf-v6-u-mt-md"
+              data-testid="add-setting-error"
             >
               {(setSetting.error as Error).message}
             </Alert>
@@ -306,7 +449,9 @@ const SettingsPage: React.FC = () => {
         <ModalFooter>
           <Button
             onClick={submitAdd}
-            isDisabled={!addKey.trim() || setSetting.isPending}
+            isDisabled={
+              !addKey.trim() || addValue === undefined || setSetting.isPending
+            }
             isLoading={setSetting.isPending}
             data-testid="confirm-add-setting"
           >
@@ -318,9 +463,60 @@ const SettingsPage: React.FC = () => {
         </ModalFooter>
       </Modal>
 
+      {/* The question before a setting is written: `Set k = v globally?` */}
+      <Modal
+        variant="small"
+        isOpen={pending !== null}
+        onClose={cancelPending}
+        aria-label="Confirm global setting change"
+        data-testid="confirm-set-modal"
+      >
+        <ModalHeader
+          title="Confirm global setting change"
+          titleIconVariant="warning"
+        />
+        <ModalBody>
+          <Content component="p" data-testid="confirm-set-question">
+            Set{' '}
+            <span className="pf-v6-u-font-family-monospace">
+              {pending?.key} ={' '}
+              {pending ? formatSettingValue(pending.value) : ''}
+            </span>{' '}
+            globally?
+          </Content>
+          {/* true the boolean and "true" the string read alike above, and the
+              gateway takes only one of them for a given key. */}
+          <Content component="p" data-testid="confirm-set-type">
+            The value is sent as{' '}
+            {pending ? settingTypeLabel(pending.value) : ''}.
+          </Content>
+          <Content component="p">
+            This will apply to all sandboxes on this gateway.
+          </Content>
+        </ModalBody>
+        <ModalFooter>
+          <Button
+            onClick={confirmPending}
+            isDisabled={setSetting.isPending}
+            isLoading={setSetting.isPending}
+            data-testid="confirm-set-setting"
+          >
+            Set globally
+          </Button>
+          <Button
+            variant="link"
+            onClick={cancelPending}
+            isDisabled={setSetting.isPending}
+            data-testid="cancel-set-setting"
+          >
+            Cancel
+          </Button>
+        </ModalFooter>
+      </Modal>
+
       <ConfirmDeleteModal
         title="Delete setting?"
-        body={`Are you sure you want to delete the setting "${deleteKey}"?`}
+        body={`Delete the global setting "${deleteKey}"? This will unset the value for all sandboxes on this gateway.`}
         isOpen={deleteKey !== null}
         isDeleting={deleteSetting.isPending}
         error={

@@ -9,11 +9,14 @@ import (
 	openshell "github.com/NVIDIA/OpenShell/sdk/go/openshell/v1"
 
 	"github.com/Gkrumbach07/openshell-dashboard/backend/pkg/clients"
+	"github.com/Gkrumbach07/openshell-dashboard/backend/pkg/models"
 )
 
 type gatewayClients struct {
-	sdk        openshell.ClientInterface
-	uploadExec *clients.RawExecClient
+	sdk openshell.ClientInterface
+	// raw is the direct gRPC client for what the SDK's own client does not
+	// offer: binary-safe uploads and the keys of a provider's credentials.
+	raw *clients.RawExecClient
 }
 
 func (c *gatewayClients) Close() {
@@ -22,9 +25,9 @@ func (c *gatewayClients) Close() {
 			slog.Warn("SDK client close failed", "error", err)
 		}
 	}
-	if c.uploadExec != nil {
-		if err := c.uploadExec.Close(); err != nil {
-			slog.Warn("upload exec client close failed", "error", err)
+	if c.raw != nil {
+		if err := c.raw.Close(); err != nil {
+			slog.Warn("raw gateway client close failed", "error", err)
 		}
 	}
 }
@@ -58,15 +61,15 @@ func newGatewayClients(gatewayURL, gatewayCACert, gatewayClientCert, gatewayClie
 	}
 
 	rawHost := strings.TrimPrefix(strings.TrimPrefix(sdkAddress, "https://"), "http://")
-	uploadExec, err := clients.NewRawExecClient(rawHost, gatewayCACert, gatewayClientCert, gatewayClientKey, useTLS)
+	raw, err := clients.NewRawExecClient(rawHost, gatewayCACert, gatewayClientCert, gatewayClientKey, useTLS)
 	if err != nil {
 		if closeErr := sdkClient.Close(); closeErr != nil {
 			slog.Warn("SDK client close failed during setup rollback", "error", closeErr)
 		}
-		return nil, fmt.Errorf("upload exec client setup failed: %w", err)
+		return nil, fmt.Errorf("raw gateway client setup failed: %w", err)
 	}
 
-	return &gatewayClients{sdk: sdkClient, uploadExec: uploadExec}, nil
+	return &gatewayClients{sdk: sdkClient, raw: raw}, nil
 }
 
 func normalizeGatewayAddress(gatewayURL string, useTLS bool) string {
@@ -100,6 +103,28 @@ func warnGatewayConfig(gatewayURL, gatewayCACert string, authDisabled bool) {
 	if authDisabled {
 		slog.Warn("AUTH_DISABLED=true — authentication is OFF; never use this outside local development")
 	}
+}
+
+// gatewaySupport reads the range of gateway releases this build supports.
+//
+// The range is handed to the BFF by whatever builds or launches it, from the
+// compat lanes that build was tested against (deploy/ci/gateway-pins.json); a
+// BFF started without one simply does not report compatibility. A range that
+// cannot be used is logged and dropped — never fatal, and never replaced by a
+// guess. The result only feeds a notice in the UI, so a bad value must not
+// stop the BFF serving, and an invented range would mislead more than a
+// missing one.
+func gatewaySupport(minVersion, maxVersion string) models.GatewaySupport {
+	support, err := models.ParseGatewaySupport(minVersion, maxVersion)
+	if err != nil {
+		slog.Warn(
+			"supported gateway range ignored — gateway compatibility will be reported as unknown; set GATEWAY_SUPPORTED_MIN and GATEWAY_SUPPORTED_MAX together, each a plain x.y.z version",
+			"error", err,
+			"min", minVersion,
+			"max", maxVersion,
+		)
+	}
+	return support
 }
 
 func exitOnError(msg string, err error) {
