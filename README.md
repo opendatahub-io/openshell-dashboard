@@ -437,6 +437,15 @@ deliberately does not move with the gateway.
 > Podman on macOS does not satisfy the gateway's Docker driver out of the box —
 > override with `DOCKER_SOCK` and `OPENSHELL_STATE_DIR` if your setup differs.
 
+## Kubernetes installation (Helm)
+
+The [dashboard Helm chart](deploy/helm/openshell-dashboard/README.md) installs the
+dashboard against an existing OpenShell gateway. It can run oauth2-proxy with an
+existing OIDC identity provider, use an external authentication proxy, or disable
+authentication explicitly for local development. Identity providers and credential
+Secrets are managed outside the chart. See the chart guide for values, installation,
+TLS, and upgrade instructions.
+
 ## Container image
 
 CI publishes `quay.io/gkrumbach07/openshell-dashboard` (linux/amd64 and linux/arm64). The image is built once per commit; every other tag is that same image, retagged by digest:

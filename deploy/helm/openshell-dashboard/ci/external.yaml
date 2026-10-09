@@ -1,0 +1,14 @@
+image:
+  tag: "1.1.1"
+gateway:
+  url: https://openshell.openshell.svc:8080
+auth:
+  mode: external
+  external:
+    allowedPeers:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: authentication
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: trusted-auth-proxy
