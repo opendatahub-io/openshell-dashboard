@@ -11,6 +11,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  check-helm:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4.3.0
+        with:
+          version: v3.18.4
+      - uses: astral-sh/setup-uv@v6
+      - name: Lint, render, and test the dashboard chart
+        run: uv run scripts/helm/test_chart.py
+
   check-frontend:
     runs-on: ubuntu-latest
     steps:
@@ -407,7 +420,7 @@ jobs:
   promote-latest:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    needs: [push-manifest, image-range, check-frontend, check-backend, e2e, compat, release-tooling]
+    needs: [push-manifest, image-range, check-frontend, check-backend, check-helm, e2e, compat, release-tooling]
     steps:
       - uses: actions/checkout@v4
       - name: Is this commit still the tip of main?

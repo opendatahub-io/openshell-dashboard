@@ -37,6 +37,7 @@ make build          # produce container image
 make test           # frontend unit tests + go tests
 make lint           # eslint + golangci-lint
 make typecheck      # tsc --noEmit
+make test-helm      # Helm chart lint, package, and render tests (Helm 3 + uv)
 ```
 
 Requires a running OpenShell gateway: `openshell gateway start` (Podman) or point `OPENSHELL_GATEWAY_URL` at an existing one.

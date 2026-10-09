@@ -22,7 +22,12 @@ description: Full development workflow for OpenShell Dashboard. Implements the c
 
 ## Verify
 
-Run in order, fix failures before proceeding:
+For chart-only changes under `deploy/helm/openshell-dashboard/`, run
+`make test-helm` (Helm 3 and `uv` required). Keep the chart README and auth-mode
+fixtures aligned with the values, and preserve ADR 0002's proxy-only access
+boundary. The chart uses externally managed identity providers and Secrets.
+
+For frontend or backend changes, run in order and fix failures before proceeding:
 
 ```bash
 make lint       # eslint + Prettier check + go vet

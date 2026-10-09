@@ -85,6 +85,15 @@ The compat sweep's automated pull requests run this themselves, so their table i
 
 One thing has to agree between the pins file and the code: its `sdk` field must equal the OpenShell SDK version in `backend/go.mod`. `node scripts/gateway-range.mjs --check` fails when it does not. Nothing else is tied together. The SDK and the gateway lanes are separate changes with separate evidence: one pull request moves the SDK (`go.mod`, `go.sum` and the `sdk` field), another moves a gateway lane, and neither needs the other ([ADR 0006](docs/adrs/0006-compat-links-and-sweep-axes.md)).
 
+### Helm chart changes
+
+The dashboard chart lives in `deploy/helm/openshell-dashboard/`. Run
+`make test-helm` (Helm 3 and `uv` required) after changing chart templates,
+values, or chart tests. CI runs the same lint, package, and render checks.
+Keep the chart README and auth-mode fixtures aligned with any configuration
+changes. Follow ADR 0002: authenticated deployments must restrict dashboard
+access to the trusted proxy, and identity providers remain externally managed.
+
 ### Developer Certificate of Origin (DCO)
 
 All commits must include a `Signed-off-by` line certifying you have the right to submit the code under the project's license. Use `git commit -s` to add it automatically:
