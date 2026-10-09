@@ -1,0 +1,182 @@
+{{- include "dashboard.validate" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "dashboard.fullname" . }}
+  labels:
+    {{- include "dashboard.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "dashboard.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "dashboard.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: dashboard
+          image: {{ include "dashboard.image" .Values.image | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            - name: PORT
+              value: "8080"
+            - name: STATIC_DIR
+              value: /srv/static
+            - name: LISTEN_ADDRESS
+              value: {{ if eq .Values.auth.mode "oauth2-proxy" }}"127.0.0.1"{{ else }}"0.0.0.0"{{ end }}
+            - name: OPENSHELL_GATEWAY_URL
+              value: {{ .Values.gateway.url | quote }}
+            - name: AUTH_DISABLED
+              value: {{ eq .Values.auth.mode "development" | quote }}
+            - name: AUTH_TOKEN_HEADER
+              value: {{ if eq .Values.auth.mode "external" }}{{ .Values.auth.external.tokenHeader | quote }}{{ else }}"x-forwarded-access-token"{{ end }}
+            - name: AUTH_USER_HEADER
+              value: {{ if eq .Values.auth.mode "external" }}{{ .Values.auth.external.userHeader | quote }}{{ else }}"x-forwarded-user"{{ end }}
+            - name: ADMIN_ROLE
+              value: {{ .Values.auth.adminRole | quote }}
+            - name: LOGOUT_URL
+              value: {{ .Values.auth.logoutUrl | quote }}
+            {{- if .Values.gateway.tls.existingSecret }}
+            - name: GATEWAY_CA_CERT
+              value: {{ printf "/etc/gateway-tls/%s" .Values.gateway.tls.caKey | quote }}
+            {{- if .Values.gateway.tls.clientCertKey }}
+            - name: GATEWAY_CLIENT_CERT
+              value: {{ printf "/etc/gateway-tls/%s" .Values.gateway.tls.clientCertKey | quote }}
+            - name: GATEWAY_CLIENT_KEY
+              value: {{ printf "/etc/gateway-tls/%s" .Values.gateway.tls.clientKeyKey | quote }}
+            {{- end }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: 8080
+          # Exec probes reach the loopback-only listener in proxy mode. BusyBox
+          # is included in the dashboard's Alpine runtime image.
+          startupProbe:
+            exec:
+              command: [wget, -q, -O, /dev/null, -T, "2", "http://127.0.0.1:8080/api/v1/healthz"]
+            periodSeconds: 2
+            failureThreshold: 30
+            timeoutSeconds: 3
+          livenessProbe:
+            exec:
+              command: [wget, -q, -O, /dev/null, -T, "2", "http://127.0.0.1:8080/api/v1/healthz"]
+            timeoutSeconds: 3
+          readinessProbe:
+            exec:
+              command: [wget, -q, -O, /dev/null, -T, "2", "http://127.0.0.1:8080/api/v1/readyz"]
+            timeoutSeconds: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          {{- if .Values.gateway.tls.existingSecret }}
+          volumeMounts:
+            - name: gateway-tls
+              mountPath: /etc/gateway-tls
+              readOnly: true
+          {{- end }}
+        {{- if eq .Values.auth.mode "oauth2-proxy" }}
+        - name: oauth2-proxy
+          image: {{ include "dashboard.image" .Values.oauth2Proxy.image | quote }}
+          imagePullPolicy: {{ .Values.oauth2Proxy.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          args:
+            - --provider=oidc
+            - {{ printf "--oidc-issuer-url=%s" .Values.oauth2Proxy.issuerUrl | quote }}
+            - {{ printf "--client-id=%s" .Values.oauth2Proxy.clientId | quote }}
+            - {{ printf "--redirect-url=%s" .Values.oauth2Proxy.redirectUrl | quote }}
+            - {{ printf "--scope=%s" .Values.oauth2Proxy.scope | quote }}
+            - --upstream=http://127.0.0.1:8080/
+            - --http-address=0.0.0.0:4180
+            - --reverse-proxy=true
+            - --proxy-websockets=true
+            - --pass-basic-auth=false
+            - --pass-user-headers=true
+            - --skip-auth-strip-headers=true
+            - --pass-access-token=true
+            - --pass-authorization-header=false
+            - --cookie-secure=true
+            - --cookie-httponly=true
+            - --cookie-samesite=lax
+            - {{ printf "--cookie-refresh=%s" .Values.oauth2Proxy.cookieRefresh | quote }}
+            - --code-challenge-method=S256
+            - --skip-provider-button=true
+            - --silence-ping-logging=true
+            # Callback query strings can contain authorization codes.
+            - --request-logging=false
+            {{- range .Values.oauth2Proxy.emailDomains }}
+            - {{ printf "--email-domain=%s" . | quote }}
+            {{- end }}
+            {{- if .Values.oauth2Proxy.providerCA.existingSecret }}
+            - {{ printf "--provider-ca-file=/etc/issuer-ca/%s" .Values.oauth2Proxy.providerCA.key | quote }}
+            {{- end }}
+          env:
+            - name: OAUTH2_PROXY_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.oauth2Proxy.existingSecret }}
+                  key: {{ .Values.oauth2Proxy.clientSecretKey }}
+            - name: OAUTH2_PROXY_COOKIE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.oauth2Proxy.existingSecret }}
+                  key: {{ .Values.oauth2Proxy.cookieSecretKey }}
+          ports:
+            - name: proxy
+              containerPort: 4180
+          livenessProbe:
+            httpGet:
+              path: /ping
+              port: proxy
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: proxy
+          resources:
+            {{- toYaml .Values.oauth2Proxy.resources | nindent 12 }}
+          {{- if .Values.oauth2Proxy.providerCA.existingSecret }}
+          volumeMounts:
+            - name: issuer-ca
+              mountPath: /etc/issuer-ca
+              readOnly: true
+          {{- end }}
+        {{- end }}
+      {{- if or .Values.gateway.tls.existingSecret (and (eq .Values.auth.mode "oauth2-proxy") .Values.oauth2Proxy.providerCA.existingSecret) }}
+      volumes:
+        {{- if .Values.gateway.tls.existingSecret }}
+        - name: gateway-tls
+          secret:
+            secretName: {{ .Values.gateway.tls.existingSecret }}
+        {{- end }}
+        {{- if and (eq .Values.auth.mode "oauth2-proxy") .Values.oauth2Proxy.providerCA.existingSecret }}
+        - name: issuer-ca
+          secret:
+            secretName: {{ .Values.oauth2Proxy.providerCA.existingSecret }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

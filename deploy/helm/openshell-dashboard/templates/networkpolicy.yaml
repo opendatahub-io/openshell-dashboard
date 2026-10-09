@@ -1,0 +1,19 @@
+{{- if eq .Values.auth.mode "external" }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "dashboard.fullname" . }}
+  labels:
+    {{- include "dashboard.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "dashboard.selectorLabels" . | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        {{- toYaml .Values.auth.external.allowedPeers | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: 8080
+{{- end }}

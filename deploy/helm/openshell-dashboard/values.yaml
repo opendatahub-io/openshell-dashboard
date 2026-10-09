@@ -1,0 +1,94 @@
+# The chart installs neither an OpenShell gateway nor an identity provider.
+replicaCount: 1
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  repository: quay.io/gkrumbach07/openshell-dashboard
+  # Required unless digest is set. Select a release compatible with your gateway.
+  tag: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+gateway:
+  # Administrative gRPC endpoint, e.g. https://openshell.openshell.svc:8080.
+  url: ""
+  # Existing Secret in the release namespace. Keys are mounted as filenames.
+  tls:
+    existingSecret: ""
+    caKey: ca.crt
+    # Optional mTLS identity; set both keys or neither.
+    clientCertKey: ""
+    clientKeyKey: ""
+
+auth:
+  # oauth2-proxy | external | development
+  mode: oauth2-proxy
+  adminRole: admin
+  logoutUrl: /oauth2/sign_out
+  external:
+    tokenHeader: x-forwarded-access-token
+    userHeader: x-auth-request-user
+    # Required in external mode. NetworkPolicy peers selecting only trusted
+    # proxy pods; the cluster CNI must enforce NetworkPolicy.
+    allowedPeers: []
+
+oauth2Proxy:
+  image:
+    repository: quay.io/oauth2-proxy/oauth2-proxy
+    tag: v7.9.0
+    digest: ""
+    pullPolicy: IfNotPresent
+  # Generic OIDC; the identity provider and client registration already exist.
+  issuerUrl: ""
+  clientId: ""
+  redirectUrl: "" # https://dashboard.example.com/oauth2/callback
+  scope: openid profile email
+  emailDomains: [] # Explicit allowlist; ["*"] allows every authenticated email.
+  # The proxy forwards the access token. Its issuer/audience/claims must be
+  # accepted by the gateway; use external mode for custom token mapping.
+  existingSecret: ""
+  clientSecretKey: client-secret
+  cookieSecretKey: cookie-secret
+  cookieRefresh: 5m
+  # Optional existing Secret containing a private issuer CA bundle.
+  providerCA:
+    existingSecret: ""
+    key: ca.crt
+  resources:
+    requests:
+      cpu: 10m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+
+service:
+  port: 80
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  host: ""
+  tlsSecretName: ""
+
+podAnnotations: {}
+# No fixed UID so the chart also works with platform-assigned non-root UIDs.
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+nodeSelector: {}
+tolerations: []
+affinity: {}

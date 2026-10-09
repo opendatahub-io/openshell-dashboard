@@ -1,0 +1,26 @@
+Dashboard release: {{ .Release.Name }}
+
+This chart does not install an OpenShell gateway or an identity provider.
+{{- if eq .Values.auth.mode "development" }}
+
+Authentication is DISABLED for local development.
+Access the dashboard on localhost:
+  kubectl --namespace {{ .Release.Namespace }} port-forward service/{{ include "dashboard.fullname" . }} 8080:{{ .Values.service.port }}
+{{- else if eq .Values.auth.mode "external" }}
+
+Point your trusted authentication proxy at:
+  http://{{ include "dashboard.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}
+Only the configured proxy peers may reach the dashboard. Your CNI must enforce
+NetworkPolicy, and no other policy may grant broader access to these pods.
+{{- else }}
+
+Complete login through the existing identity provider using the dashboard host
+configured in oauth2Proxy.redirectUrl. The Service exposes only oauth2-proxy;
+the dashboard itself listens on localhost inside the pod.
+{{- end }}
+{{- if .Values.ingress.enabled }}
+
+Dashboard URL: https://{{ .Values.ingress.host }}
+{{- end }}
+
+The readiness probe checks gateway connectivity, not browser login or RBAC.

@@ -1,0 +1,9 @@
+apiVersion: v2
+name: openshell-dashboard
+description: OpenShell dashboard with an optional authentication proxy for an external identity provider
+type: application
+version: 0.1.0
+kubeVersion: ">=1.25.0-0"
+home: https://github.com/opendatahub-io/openshell-dashboard
+sources:
+  - https://github.com/opendatahub-io/openshell-dashboard

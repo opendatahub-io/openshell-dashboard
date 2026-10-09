@@ -1,0 +1,22 @@
+# Render/lint fixture: no real credentials or running IdP required.
+image:
+  tag: "1.1.1"
+gateway:
+  url: https://openshell.openshell.svc:8080
+  tls:
+    existingSecret: gateway-client-tls
+    clientCertKey: tls.crt
+    clientKeyKey: tls.key
+oauth2Proxy:
+  issuerUrl: https://idp.example.com/realms/openshell
+  clientId: openshell-dashboard
+  redirectUrl: https://dashboard.example.com/oauth2/callback
+  existingSecret: dashboard-oauth2
+  emailDomains: [example.com]
+  providerCA:
+    existingSecret: issuer-ca
+ingress:
+  enabled: true
+  className: nginx
+  host: dashboard.example.com
+  tlsSecretName: dashboard-tls

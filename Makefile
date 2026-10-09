@@ -65,6 +65,10 @@ OPENSHELL_VERSION ?= latest
 export OPENSHELL_VERSION
 
 .PHONY: compat compat-up compat-down
+.PHONY: test-helm
+test-helm: ## Lint, render, and test the Helm chart (requires Helm 3 and uv)
+	uv run scripts/helm/test_chart.py
+
 compat: ## Gateway compat suite vs a real gateway (OPENSHELL_VERSION=0.1.2 make compat)
 	deploy/ci/e2e-stack.sh run
 
