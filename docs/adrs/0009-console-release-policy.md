@@ -244,6 +244,107 @@ Whether a release is started by a person is not changed by this ADR. What
 stands besides: a release is cut from a commit whose CI run passed, and a
 merged move to a new gateway patch release is released as a patch.
 
+## Amendments
+
+- **2026-10-09: decisions 6, 7 and 8 are implemented, and the compat sweep is
+  retired.** Two of the items "Implemented in steps" lists as not built are
+  built now ("The compat sweep is unchanged" and "There is no `next` branch
+  and no `release/<major>.<minor>` branch"), and what that section and
+  "Consequences" say about lanes and the sweep describes the state before
+  this.
+
+  - *One gateway per branch (decision 6).* `deploy/ci/gateway-pins.json` names
+    one upstream release: `release`, its gateway and supervisor images by
+    digest, and `sdk`. It no longer lists lanes. `ci.yml` runs the
+    compatibility suite against that gateway on pushes to `main` and
+    `release/**` and on pull requests into `main`, `next` and `release/**`.
+    The built-in line is the line of that release. The second release `main`
+    used to run, 0.1.0, is no longer run: the rest of the line rests on
+    decision 10 alone.
+  - *Release pickup (decision 7).* `.github/workflows/follow-upstream.yml`
+    reads upstream's tags every hour. Its target is the newest stable release
+    above the one `main` pins, or failing that the newest pre-release that
+    leads up to one. Several stable releases waiting are not walked through.
+    Moving to the target is one commit: the images, the SDK at the tag's
+    commit, the built-in line when the minor changes, and the README's
+    generated block.
+  - *Pre-releases (decision 8).* The same workflow keeps the `next` branch in
+    one shape (`main`, that one commit, then people's commits) and keeps its
+    pull request into `main` open: a draft while the target is a pre-release,
+    ready for review once it is a stable release. It runs check A, the BFF as
+    `main` builds it against the target's gateway, and keeps one issue for a
+    failure. Check B is CI on the `next` pull request. A CI check of its own,
+    `pins a stable release`, keeps a pre-release out of `main` and
+    `release/**`, so that a `next` that is not released upstream yet is not
+    read as a compatibility failure.
+  - *What replaced the sweep.* `compat-sweep.yml`, its gateway axis and SDK
+    axis, the `compat-sweep/*` branches and the one-axis guard are removed;
+    `deploy/ci/sweep/` became `deploy/ci/upstream/`. Upstream HEAD is no longer
+    probed: pre-releases are. The consequence above, "The sweep cannot move the
+    console to a new gateway minor on its own", no longer applies, because the
+    pin move changes the built-in line in the same commit. A move to a new
+    minor still cannot merge until the compatibility suite passes on it.
+  - *The automatic release* is the merge of `next`
+    (`scripts/release/next-merge.mjs`). It is still cut as a patch.
+  - *`release/<major>.<minor>`* is created from `main` by the workflow when the
+    target is a stable release on a new minor. It is created, not kept up to
+    date, and nothing cuts a release from it yet.
+
+  Still not built: the console's version sharing the gateway's line, and the
+  release type following from what the release is (decisions 1 to 4). A move
+  to a new gateway minor is therefore still released as a patch, and the
+  `next` pull request says so when it applies.
+
+- **2026-10-09: the version of a release is computed (decisions 1 to 5, as
+  far as version numbers go).** The two things the amendment above lists as
+  still not built are built: the console's version shares the gateway's line,
+  and nobody chooses a release type.
+
+  - *The computation.* The line is the major and minor number of the stable
+    release the branch pins: `release` in `deploy/ci/gateway-pins.json`, which
+    CI holds to the built-in line. The version is `<line>.<n>`, where `n` is
+    one more than the highest patch among the release tags `v<line>.*` that
+    exist, and `0` when the line has none
+    (`scripts/release/next-version.mjs`). Tags on other lines are ignored,
+    and so is any tag that is not exactly `vX.Y.Z`. A branch that pins a
+    pre-release is not released.
+  - *Decision 1.* The first two numbers of a release are its gateway line, so
+    whether a console works with a gateway can be read off two version
+    numbers.
+  - *Decisions 2 and 4.* There is no release type. The first release after
+    the pin moves to a new gateway minor is `X.Y.0`, because that line has no
+    tag yet, and every other release is the next patch. Nothing a contributor
+    writes can start a minor. "Held until the compatibility suite passes" is
+    enforced as it was: a release needs a green CI run for its commit.
+  - *Decision 3.* The merge of `next` is still released without being asked,
+    and its version is computed like any other: the next patch for a move
+    within the line, `X.Y.0` for a move to a new minor.
+  - *Decision 5.* The release workflow can be started by hand on
+    `release/<major>.<minor>`, where the same computation gives that line its
+    next patch. Only that line's `X.Y` image tag moves. The branch has to pin
+    its own line, and the commit has to contain the newest release of its
+    line. Keeping a release branch up to date, and deciding what is
+    backported to it, is still a person's work.
+  - *How.* `semantic-release` is removed. It numbers a release as the last
+    tag plus a chosen kind of bump, and starts a history at `1.0.0`; neither
+    is this model. `scripts/release/cut-release.mjs` computes the version,
+    writes the notes (the titles of the commits since the previous release,
+    then the *Supported OpenShell gateways* section) and creates the GitHub
+    release, which creates the tag.
+  - *What a running console shows.* No version number: an image is built
+    before a release is cut and is only given more tags afterwards. The About
+    dialog shows the gateway release line the build is for, and the commit it
+    is built from when the build was told.
+  - *The releases from before.* The tags `v0.1.3`, `v0.2.0`, `v0.3.0` and
+    `v1.0.0` to `v1.2.0` were numbered from commit titles. The computation
+    cannot tell them from its own, so `v0.1.3` is counted on the `0.1` line
+    for as long as it exists. What can be told is that its commit was not
+    built for that line: a dry run says so, and a real run refuses to release
+    while it is counted. This change deletes no tag and no release. "A reader needs two numbers, not a table", under
+    Consequences, holds for every release cut from here on.
+
+  ADR 0007's own amendment says which of its decisions this replaces.
+
 ## References
 
 - [RFC 0014](https://github.com/NVIDIA/OpenShell/tree/main/rfc/0014-release-stability) — OpenShell's proposed release and stability policy, whose terms and whose rule on Stable interfaces this ADR uses

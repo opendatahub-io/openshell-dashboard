@@ -31,6 +31,16 @@ You need a running OpenShell gateway. Either `openshell gateway start` (Podman) 
    ```
 4. Open a pull request against `main`
 
+### Where a pull request goes
+
+**`main`, by default.** `main` is built on one released OpenShell gateway, and CI tests every pull request against it. If your change builds and passes there, it goes there.
+
+**`next`, only if it cannot build or pass on `main`.** `next` is `main` moved to the upcoming gateway release: the Go SDK and the gateway CI runs are upstream's newest pre-release. Work that needs something only that release has (a new SDK method, an RPC the released gateway does not serve) cannot land on `main` yet, so it targets `next`, and reaches `main` when `next` merges on the day upstream releases. Branch from `next` for it. A workflow keeps `next` rebased onto `main` and force-pushes it, so rebase your branch after it has moved (`git fetch origin && git rebase --fork-point origin/next`). If there is no `next`, upstream has nothing ahead of `main`.
+
+**`release/X.Y`**, for a critical or security fix to the release line before `main`'s. Nothing else is backported ([ADR 0009](docs/adrs/0009-console-release-policy.md)).
+
+Do not move the pinned gateway or the SDK in a pull request of your own; see [The pinned OpenShell release](#the-pinned-openshell-release).
+
 ### Commit conventions
 
 Use [Conventional Commits](https://www.conventionalcommits.org/):
@@ -45,50 +55,42 @@ test: add sandbox create form tests
 
 Feature and behavior PRs should link an accepted issue.
 
-#### Merging does not release; the title still matters
+#### Merging does not release; the title is the release note
 
-Merging a pull request publishes nothing. A release is cut by a person, who starts the `Release` workflow on `main` and chooses patch, minor or major ([docs/releasing.md](docs/releasing.md)). The one exception is a pull request opened by the compat sweep, which is released as a patch once it is merged.
+Merging a pull request publishes nothing. A release is started by a person, who runs the `Release` workflow on `main` ([docs/releasing.md](docs/releasing.md)). The one exception is the pull request from `next`, the move to a new OpenShell release, which is released once it is merged.
 
-The commit message still does two jobs, so write it as carefully as before. With a squash merge the pull request **title** is the commit message. It is what the release notes are written from, and it is what the person cutting the release is told the commits suggest:
+Nobody chooses the version of a release, and no title changes it. It is the gateway release line the branch is built on, then the next patch number ([ADR 0009](docs/adrs/0009-console-release-policy.md)): a `feat:` does not make a minor, and a `!` does not make a major.
 
-| Commit | Release it suggests |
+The title still matters, because it is the release note. With a squash merge the pull request **title** is the commit message, and the notes of a release list the title of every commit since the release before it, as written. Write it for someone reading the release page:
+
+| Commit | In the release notes |
 |--------|-----------------|
-| `fix: …`, `perf: …` | patch |
-| `feat: …` | minor |
-| a `!` after the type or scope (`feat!: …`, `fix(bff)!: …`), or a `BREAKING CHANGE:` footer | major |
-| `docs:`, `test:`, `chore:`, `build:`, `refactor:`, `style:` | none |
-| anything whose type or scope is `ci` (`ci: …`, `fix(ci): …`, `feat(ci): …`), even when marked breaking | none |
-| a `git revert` under the title git gives it, `Revert "…"`, **whatever it reverts** | patch |
-| any other title that is not a Conventional Commit, such as `Add foo (#74)` | none |
+| `fix: …`, `feat: …`, `perf: …`, `docs: …`, and every other type | listed, as written |
+| anything whose type or scope is `ci` (`ci: …`, `fix(ci): …`, `feat(ci)!: …`) | left out |
+| a `git revert` under the title git gives it, `Revert "…"`, **whatever it reverts** | listed |
+| any other title that is not a Conventional Commit, such as `Add foo (#74)` | listed, as written |
 
-**Workflow changes use the `ci:` type.** A change to `.github/workflows/`, or to the scripts CI and the release pipeline run, alters nothing in the image, so it does not belong in the release notes and must not make the commits look like they call for a release. When releases were automatic, `fix(ci):` and `feat(ci):` did worse than that: releases 1.0.1, 1.0.2, 1.0.3 and 1.1.0 were each published by a commit that changed nothing we ship. A `ci` scope is treated the same as the `ci` type, but write `ci:` so the title says what the change is.
+**Workflow changes use the `ci:` type.** A change to `.github/workflows/`, or to the scripts CI and the release pipeline run, alters nothing in the image, so it does not belong in the release notes. A `ci` scope is treated the same as the `ci` type, but write `ci:` so the title says what the change is.
 
-A commit whose type or scope is `ci` is left out of the release notes and suggests no release, even when it is marked breaking.
-
-**Reverting a CI change: title it `ci: revert …`.** The title `git revert` writes, `Revert "ci: pin the runners"`, has no type and no scope, so nothing can tell that the commit it undoes was about CI. Left as it is, the revert is listed in the next release's notes and counts as suggesting a patch. Retitle the commit, or the pull request if it is squash-merged:
+**Reverting a CI change: title it `ci: revert …`.** The title `git revert` writes, `Revert "ci: pin the runners"`, has no type and no scope, so nothing can tell that the commit it undoes was about CI, and it is listed in the next release's notes. Retitle the commit, or the pull request if it is squash-merged:
 
 ```
 ci: revert "pin the runners"
 ```
 
-Use `fix:` or `feat:` only for something a user of the dashboard would notice. The rules live in [`release.config.cjs`](release.config.cjs); CI runs sample commits through them on every pull request (`scripts/release/check-release-config.mjs`), and [docs/releasing.md](docs/releasing.md) describes the rest of the pipeline.
+Use `fix:` or `feat:` only for something a user of the dashboard would notice, and mark a breaking change with a `!` after the type or scope (`fix(bff)!: …`) so that it stands out in the notes. What is listed is decided by `isCiCommit` in [`scripts/release/release-notes.mjs`](scripts/release/release-notes.mjs), which the script tests cover, and [docs/releasing.md](docs/releasing.md) describes the rest of the pipeline.
 
-#### If you move a gateway lane or the SDK pin
+#### The pinned OpenShell release
 
-The OpenShell gateway release line a release is for, and the releases it is tested on, are derived from the required lanes in `deploy/ci/gateway-pins.json`, never written by hand. The README restates them in one generated table, which has to be regenerated in the same change that moves the pins:
+`deploy/ci/gateway-pins.json` names the one OpenShell release a branch is built on: the gateway and supervisor images CI runs, and the Go SDK in `backend/go.mod`. The three come from one upstream release tag and move together, in one commit ([ADR 0009](docs/adrs/0009-console-release-policy.md)).
 
-```bash
-node scripts/readme-gateway-range.mjs --write
-```
+You do not move it. The [Follow upstream](.github/workflows/follow-upstream.yml) workflow finds new releases from upstream's tags and makes the move on `next`, as the first commit after `main`; merging `next` is how `main` gets it ([`deploy/ci/upstream/README.md`](deploy/ci/upstream/README.md)). A pull request into `main` or `release/**` that pins a pre-release fails the `pins a stable release` check.
 
-The compat sweep's automated pull requests run this themselves, so their table is already up to date when they are opened. Run it yourself when you change the pins file by hand, and commit the result with the pins.
+If you do have to change the pins by hand, these have to stay in step, and CI fails when they are not:
 
-Two things have to agree between the pins file and the code, and `node scripts/gateway-range.mjs --check` fails when either does not:
-
-- The `sdk` field must equal the OpenShell SDK version in `backend/go.mod`.
-- The gateway release line compiled into the BFF (`BuiltInGatewayReleaseLine` in `backend/pkg/models/gateway_release_line.go`) must be the major and minor number of the newest required lane. Moving that lane to a newer patch release changes nothing here. Moving it to a new minor is a new release line, and the constant changes in the same pull request ([ADR 0009](docs/adrs/0009-console-release-policy.md)).
-
-Nothing else is tied together. The SDK and the gateway lanes are separate changes with separate evidence: one pull request moves the SDK (`go.mod`, `go.sum` and the `sdk` field), another moves a gateway lane, and neither needs the other ([ADR 0006](docs/adrs/0006-compat-links-and-sweep-axes.md)).
+- The `sdk` field must equal the OpenShell SDK version in `backend/go.mod`, and the image tags must be the release (`python3 deploy/ci/upstream/follow.py validate-pins --go-mod backend/go.mod`).
+- The gateway release line compiled into the BFF (`BuiltInGatewayReleaseLine` in `backend/pkg/models/gateway_release_line.go`) must be the major and minor number of the pinned release. A newer patch release changes nothing here. A new minor is a new release line, and the constant changes in the same commit (`node scripts/gateway-range.mjs --check`).
+- The README restates the release and the SDK in one generated table: `node scripts/readme-gateway-range.mjs --write`.
 
 ### Developer Certificate of Origin (DCO)
 
