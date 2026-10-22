@@ -93,7 +93,15 @@ func FromSDKSandbox(sandbox *openshell.Sandbox) Sandbox {
 			Path:           endpoint.Path,
 			LastResult:     sdkEndpointResultString(endpoint.LastResult),
 			LastReportedAt: endpoint.LastReportedAt,
+			LastFailure:    fromSDKEndpointFailure(endpoint.LastFailure),
 		})
+	}
+	if observation := sandbox.Status.LastTokenGrantFailure; observation != nil {
+		out.Status.LastTokenGrantFailure = &TokenGrantFailureObservation{
+			DestinationHost: observation.DestinationHost,
+			DestinationPort: observation.DestinationPort,
+			Failure:         fromSDKEndpointFailure(observation.Failure),
+		}
 	}
 	if admission := sandbox.Status.ConfigurationAdmission; admission != nil {
 		// The SDK calls a state the gateway left unspecified "unknown".
@@ -141,6 +149,31 @@ func fromSDKSpecTemplate(t *openshell.SandboxTemplate) *SandboxSpecTemplate {
 		return nil
 	}
 	return &out
+}
+
+// fromSDKEndpointFailure converts the cause of a failed exchange, and returns
+// nil when the sandbox classified none.
+func fromSDKEndpointFailure(failure *openshell.EndpointFailure) *EndpointFailure {
+	if failure == nil {
+		return nil
+	}
+	return &EndpointFailure{
+		Domain:             sdkEndpointFailureDomainString(failure.Domain),
+		Code:               failure.Code,
+		RecoveryAction:     sdkRecoveryActionString(failure.RecoveryAction),
+		Provider:           failure.Provider,
+		CredentialKey:      failure.CredentialKey,
+		Stage:              failure.Stage,
+		UpstreamHTTPStatus: failure.UpstreamHTTPStatus,
+		RequestID:          failure.RequestID,
+	}
+}
+
+func sdkEndpointFailureDomainString(domain openshell.EndpointFailureDomain) string {
+	if domain == openshell.EndpointFailureDomainTokenGrant {
+		return "TOKEN_GRANT"
+	}
+	return "UNSPECIFIED"
 }
 
 func sdkEndpointResultString(result openshell.EndpointResult) string {
@@ -205,20 +238,27 @@ func BuildSDKSandboxSpec(req CreateSandboxRequest) (*openshell.SandboxSpec, erro
 }
 
 // BuildSDKCreateOptions builds the options of a sandbox create: the sandbox's
-// annotations and the services to expose with it. It returns none when there
-// is neither.
-func BuildSDKCreateOptions(annotations map[string]string, exposures []ServiceExposure) []openshell.CreateOptions {
-	if len(annotations) == 0 && len(exposures) == 0 {
-		return nil
+// labels and annotations and the services to expose with it. It returns an
+// option only for what the request sets, and none when it sets nothing.
+func BuildSDKCreateOptions(labels, annotations map[string]string, exposures []ServiceExposure) []openshell.CreateOption {
+	var opts []openshell.CreateOption
+	if len(labels) > 0 {
+		opts = append(opts, openshell.WithLabels(labels))
 	}
-	opts := openshell.CreateOptions{Annotations: annotations}
-	for _, exposure := range exposures {
-		opts.ServiceExposures = append(opts.ServiceExposures, openshell.ServiceExposure{
-			Service:    exposure.Service,
-			TargetPort: exposure.TargetPort,
-		})
+	if len(annotations) > 0 {
+		opts = append(opts, openshell.WithAnnotations(annotations))
 	}
-	return []openshell.CreateOptions{opts}
+	if len(exposures) > 0 {
+		sdkExposures := make([]openshell.ServiceExposure, 0, len(exposures))
+		for _, exposure := range exposures {
+			sdkExposures = append(sdkExposures, openshell.ServiceExposure{
+				Service:    exposure.Service,
+				TargetPort: exposure.TargetPort,
+			})
+		}
+		opts = append(opts, openshell.WithServiceExposures(sdkExposures...))
+	}
+	return opts
 }
 
 func sdkSettingScopeString(scope openshell.SettingScope) string {
