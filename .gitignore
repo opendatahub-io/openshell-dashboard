@@ -28,6 +28,10 @@ frontend/cypress/screenshots/
 .env.*
 .claude/worktrees/
 
+# Local agent guidance
+.agents/
+AGENTS.md
+
 # compat stack rendered config
 deploy/ci/.rendered/
 

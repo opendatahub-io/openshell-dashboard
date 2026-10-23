@@ -3,6 +3,8 @@ import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import { RESOURCE_POLL_MS, SANDBOX_POLL_MS } from '../constants';
 import { get } from './client';
 import { allWorkspacesKeys } from './queryKeys';
+import { pagedPath } from './pagination';
+import type { ListPage, PageRequest } from './pagination';
 import type {
   Provider,
   Sandbox,
@@ -23,6 +25,19 @@ const withLabelSelector = (path: string, labelSelector?: string): string =>
 
 export const listAllSandboxes = (labelSelector?: string): Promise<Sandbox[]> =>
   get<Sandbox[]>(withLabelSelector('/api/v1/sandboxes', labelSelector));
+
+export const listAllSandboxPage = (
+  request: PageRequest,
+): Promise<ListPage<Sandbox>> =>
+  get<ListPage<Sandbox>>(pagedPath('/api/v1/sandboxes', request));
+
+export const useAllSandboxPage = (request: PageRequest) =>
+  useQuery({
+    queryKey: allWorkspacesKeys.sandboxPage(request),
+    queryFn: () => listAllSandboxPage(request),
+    placeholderData: keepPreviousData,
+    refetchInterval: SANDBOX_POLL_MS,
+  });
 
 // The gateway has no filter for providers, in a workspace or across them.
 export const listAllProviders = (): Promise<Provider[]> =>
@@ -45,19 +60,29 @@ export const listAllServices = (): Promise<ServiceEndpoint[]> =>
 // when someone changes them, in a workspace this page is not looking at, and
 // are read again at the slower pace of such lists.
 
-export const useAllSandboxes = (labelSelector?: string) =>
+// `enabled` and `refetchInterval` are for the shell, which counts sandboxes on
+// every page: it must not ask a user the gateway will refuse, and it reads at
+// NAV_COUNT_POLL_MS. The Gateway page reads at GATEWAY_PAGE_POLL_MS. The
+// Sandboxes page leaves both alone.
+export const useAllSandboxes = (
+  labelSelector?: string,
+  options: { enabled?: boolean; refetchInterval?: number } = {},
+) =>
   useQuery({
     queryKey: allWorkspacesKeys.sandboxes(labelSelector),
     queryFn: () => listAllSandboxes(labelSelector),
-    refetchInterval: SANDBOX_POLL_MS,
+    refetchInterval: options.refetchInterval ?? SANDBOX_POLL_MS,
     placeholderData: keepPreviousData,
+    enabled: options.enabled ?? true,
   });
 
-export const useAllProviders = () =>
+// `refetchInterval` is for the Gateway page, which only asks whether any
+// provider exists yet; the Resources page leaves it alone.
+export const useAllProviders = (options: { refetchInterval?: number } = {}) =>
   useQuery({
     queryKey: allWorkspacesKeys.providers,
     queryFn: listAllProviders,
-    refetchInterval: RESOURCE_POLL_MS,
+    refetchInterval: options.refetchInterval ?? RESOURCE_POLL_MS,
   });
 
 export const useAllTemplates = (labelSelector?: string) =>
